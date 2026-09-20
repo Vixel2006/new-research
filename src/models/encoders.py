@@ -110,9 +110,9 @@ class ViTLayer(nnx.Module):
         # boolean applied once per frame: inside a frame block it's fully connected,
         # across frames it's causal.
         tpf = tokens_per_frame
-        self.causal_mask = jnp.kron(
-            self.mask, jnp.ones((tpf, tpf), dtype=bool)
-        )[None, None]  # (1, 1, L, L) broadcastable to (B, heads, L, L)
+        self.causal_mask = jnp.kron(self.mask, jnp.ones((tpf, tpf), dtype=bool))[
+            None, None
+        ]  # (1, 1, L, L) broadcastable to (B, heads, L, L)
 
         self.norm1 = nnx.LayerNorm(embed_dim, rngs=rngs)
 
@@ -162,9 +162,7 @@ class ViT(nnx.Module):
 
         self.layers = nnx.List(
             [
-                ViTLayer(
-                    trajectory, self.tokens_per_frame, embed_dim, num_heads, rngs
-                )
+                ViTLayer(trajectory, self.tokens_per_frame, embed_dim, num_heads, rngs)
                 for _ in range(num_layers)
             ]
         )
@@ -189,6 +187,34 @@ class ViT(nnx.Module):
         return x
 
 
+class Embedder(nnx.Module):
+    """Action Encoder and embedder"""
+
+    def __init__(
+        self,
+        input_dim: int,
+        smoothed_dim: int,
+        emb_dim: int,
+        mlp_scale: int,
+        rngs: nnx.Rngs,
+    ):
+        self.patch_embed = nnx.Conv(
+            input_dim, smoothed_dim, kernel_size=1, strides=1, rngs=rngs
+        )
+        self.embed = nnx.Sequential(
+            nnx.Linear(smoothed_dim, mlp_scale * emb_dim, rngs=rngs),
+            nnx.selu,
+            nnx.Linear(mlp_scale * emb_dim, emb_dim, rngs=rngs),
+        )
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        x = x.transpose(0, 2, 1)  # (B, T, D) -> (B, D, T)
+        x = self.patch_embed(x)
+        x = x.transpose(0, 2, 1)  # (B, D, T) -> (B, T, D)
+        x = self.embed(x)
+        return x
+
+
 if __name__ == "__main__":
     rngs = nnx.Rngs(42)
     batch_size = 64
@@ -196,15 +222,20 @@ if __name__ == "__main__":
     H = 64
     W = 64
     C = 3
+    D = 10
     patch_size = 16
     embed_dim = 192
     num_layers = 4
     num_heads = 16
 
-    img = jax.random.normal(rngs.params(), (batch_size, T, H, W, C))
+    o_t = jax.random.normal(rngs.params(), (batch_size, T, H, W, C))
+    a_t = jax.random.normal(rngs.params(), (batch_size, T, D))
 
     vit = ViT(C, T, patch_size, H, embed_dim, num_layers, num_heads, rngs)
+    embedder = Embedder(D, D, D, 4, rngs)
 
-    out = vit(img)
+    z_t = vit(o_t)
+    a_t = embedder(a_t)
 
-    print(out.shape)  # (64, 10, 192)
+    print(z_t.shape)  # (64, 10, 192)
+    print(a_t.shape)  # (64, 10, 10)
