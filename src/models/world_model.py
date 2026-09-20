@@ -1,18 +1,15 @@
-"""LeWorldModel: Main JEPA Model"""
-
-from flax import nnx
-import jax.numpy as jnp
-import jax
 from dataclasses import dataclass
 
-from .encoder import CNNEncoder, ActionEncoder, Projector
+import jax
+import jax.numpy as jnp
+from flax import nnx
+
+from .encoder import ActionEncoder, CNNEncoder, Projector
 from .predictor import ARPredictor, PredictorProjector
-from .sigreg import SIGReg
 
 
 @dataclass
-class LeWMConfig:
-    """Configuration for LeWorldModel"""
+class WorldModelConfig:
     embed_dim: int = 192
     img_size: int = 64
     in_channels: int = 3
@@ -36,9 +33,7 @@ class LeWMConfig:
 
 
 class LeWorldModel(nnx.Module):
-    """LeWorldModel: Joint-Embedding Predictive Architecture"""
-
-    def __init__(self, config: LeWMConfig, rngs: nnx.Rngs):
+    def __init__(self, config: WorldModelConfig, rngs: nnx.Rngs):
         self.config = config
 
         # Encoder: pixels -> embeddings
@@ -82,12 +77,26 @@ class LeWorldModel(nnx.Module):
             rngs=rngs,
         )
 
-        # SIGReg regularizer
-        self.sigreg = SIGReg(
-            knots=config.sigreg_knots,
-            num_proj=config.sigreg_num_proj,
-            rngs=rngs,
+    @classmethod
+    def create(
+        cls,
+        embed_dim: int = 192,
+        img_size: int = 64,
+        action_dim: int = 2,
+        history_size: int = 3,
+        seed: int = 0,
+        **kwargs,
+    ) -> "LeWorldModel":
+        """Factory method to create LeWorldModel with default config."""
+        config = WorldModelConfig(
+            embed_dim=embed_dim,
+            img_size=img_size,
+            action_dim=action_dim,
+            history_size=history_size,
+            **kwargs,
         )
+        rngs = nnx.Rngs(seed)
+        return cls(config, rngs)
 
     def encode(self, pixels: jax.Array) -> jax.Array:
         """
@@ -97,7 +106,9 @@ class LeWorldModel(nnx.Module):
         Returns:
             (B, T, D) or (B, D)
         """
-        if pixels.ndim == 4:
+        if pixels.ndim == 3:
+            pixels = pixels[None, None]  # (1, 1, H, W, C)
+        elif pixels.ndim == 4:
             pixels = pixels[:, None]  # (B, 1, H, W, C)
 
         B, T, H, W, C = pixels.shape
@@ -105,7 +116,7 @@ class LeWorldModel(nnx.Module):
 
         # Encode each frame
         emb = self.encoder(pixels)  # (B*T, D)
-        emb = self.projector(emb)   # (B*T, D)
+        emb = self.projector(emb)  # (B*T, D)
         emb = emb.reshape(B, T, -1)  # (B, T, D)
         return emb
 
@@ -140,12 +151,14 @@ class LeWorldModel(nnx.Module):
         self,
         pixels: jax.Array,
         actions: jax.Array,
+        sigreg_fn,
     ) -> dict:
         """
         Compute LeWM loss (prediction + SIGReg).
         Args:
             pixels: (B, T, H, W, C) where T = history_size + num_preds
             actions: (B, T, action_dim)
+            sigreg_fn: SIGReg function/module
         Returns:
             dict with losses
         """
@@ -158,13 +171,13 @@ class LeWorldModel(nnx.Module):
         act_emb = self.encode_actions(actions)  # (B, T, D)
 
         # Teacher forcing: predict from history
-        ctx_emb = emb[:, :H]           # (B, H, D)
-        ctx_act = act_emb[:, :H]       # (B, H, D)
-        tgt_emb = emb[:, H:H+N]        # (B, N, D) - targets
+        ctx_emb = emb[:, :H]  # (B, H, D)
+        ctx_act = act_emb[:, :H]  # (B, H, D)
+        tgt_emb = emb[:, H : H + N]  # (B, N, D) - targets
 
         # Predict
         pred_emb = self.predict(ctx_emb, ctx_act)  # (B, H, D)
-        pred_emb = pred_emb[:, -N:]    # (B, N, D) - last N predictions
+        pred_emb = pred_emb[:, -N:]  # (B, N, D) - last N predictions
 
         # Prediction loss (MSE)
         pred_loss = jnp.mean((pred_emb - tgt_emb) ** 2)
@@ -172,7 +185,7 @@ class LeWorldModel(nnx.Module):
         # SIGReg loss on all embeddings
         # Reshape to (T, B, D) for SIGReg
         emb_tbd = jnp.transpose(emb, (1, 0, 2))
-        sigreg_loss = self.sigreg(emb_tbd)
+        sigreg_loss = sigreg_fn(emb_tbd)
 
         total_loss = pred_loss + cfg.sigreg_weight * sigreg_loss
 
@@ -181,6 +194,47 @@ class LeWorldModel(nnx.Module):
             "pred_loss": pred_loss,
             "sigreg_loss": sigreg_loss,
         }
+
+    def rollout_from_embeddings(
+        self,
+        init_embeddings: jax.Array,
+        action_sequence: jax.Array,
+    ) -> jax.Array:
+        """
+        Autoregressive rollout in latent space, starting from pre-encoded embeddings.
+        Args:
+            init_embeddings: (B, H, D) - encoded history frames
+            action_sequence: (B, T_rollout, action_dim) - future actions
+        Returns:
+            (B, T_rollout, D) - predicted embeddings
+        """
+        act_emb = self.encode_actions(action_sequence)  # (B, T, D)
+
+        B, H, D = init_embeddings.shape
+        T = action_sequence.shape[1]
+
+        # Autoregressive rollout
+        preds = []
+        curr_emb = init_embeddings
+
+        for t in range(T):
+            # Use last H embeddings
+            ctx_emb = curr_emb[:, -H:]
+            ctx_act = act_emb[:, t : t + H] if t + H <= T else act_emb[:, t:]
+
+            # Pad if needed
+            if ctx_act.shape[1] < H:
+                pad = jnp.zeros((B, H - ctx_act.shape[1], D))
+                ctx_act = jnp.concatenate([ctx_act, pad], axis=1)
+
+            # Predict next
+            pred = self.predict(ctx_emb, ctx_act)[:, -1:]  # (B, 1, D)
+            preds.append(pred)
+
+            # Append to history
+            curr_emb = jnp.concatenate([curr_emb, pred], axis=1)
+
+        return jnp.concatenate(preds, axis=1)  # (B, T, D)
 
     def rollout(
         self,
@@ -200,33 +254,7 @@ class LeWorldModel(nnx.Module):
             init_pixels = init_pixels[:, None]
 
         emb = self.encode(init_pixels)  # (B, H, D)
-        act_emb = self.encode_actions(action_sequence)  # (B, T, D)
-
-        B, H, D = emb.shape
-        T = action_sequence.shape[1]
-
-        # Autoregressive rollout
-        preds = []
-        curr_emb = emb
-
-        for t in range(T):
-            # Use last H embeddings
-            ctx_emb = curr_emb[:, -H:]
-            ctx_act = act_emb[:, t:t+H] if t + H <= T else act_emb[:, t:]
-
-            # Pad if needed
-            if ctx_act.shape[1] < H:
-                pad = jnp.zeros((B, H - ctx_act.shape[1], D))
-                ctx_act = jnp.concatenate([ctx_act, pad], axis=1)
-
-            # Predict next
-            pred = self.predict(ctx_emb, ctx_act)[:, -1:]  # (B, 1, D)
-            preds.append(pred)
-
-            # Append to history
-            curr_emb = jnp.concatenate([curr_emb, pred], axis=1)
-
-        return jnp.concatenate(preds, axis=1)  # (B, T, D)
+        return self.rollout_from_embeddings(emb, action_sequence)
 
 
 def create_model(
@@ -237,11 +265,10 @@ def create_model(
     seed: int = 0,
 ) -> LeWorldModel:
     """Factory function to create LeWorldModel with default config."""
-    config = LeWMConfig(
+    return LeWorldModel.create(
         embed_dim=embed_dim,
         img_size=img_size,
         action_dim=action_dim,
         history_size=history_size,
+        seed=seed,
     )
-    rngs = nnx.Rngs(seed)
-    return LeWorldModel(config, rngs)

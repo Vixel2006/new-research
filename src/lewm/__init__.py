@@ -1,0 +1,53 @@
+"""LeWorldModel JAX - Main package
+
+This is a wrapper that re-exports from the internal src module.
+"""
+from src import (
+    LeWorldModel,
+    WorldModelConfig,
+    create_model,
+    CNNEncoder,
+    ActionEncoder,
+    Projector,
+    ARPredictor,
+    AdaLNBlock,
+    PredictorProjector,
+    modulate,
+    SIGReg,
+    Trainer,
+    TrainConfig,
+    create_trainer,
+    EnvConfig,
+    GymEnvWrapper,
+    Simple2DEnv,
+    collect_trajectories,
+    make_dataset,
+    CEMConfig,
+    CEMPlanner,
+    create_planner,
+)
+
+__all__ = [
+    "LeWorldModel",
+    "WorldModelConfig",
+    "create_model",
+    "CNNEncoder",
+    "ActionEncoder",
+    "Projector",
+    "ARPredictor",
+    "AdaLNBlock",
+    "PredictorProjector",
+    "modulate",
+    "SIGReg",
+    "Trainer",
+    "TrainConfig",
+    "create_trainer",
+    "EnvConfig",
+    "GymEnvWrapper",
+    "Simple2DEnv",
+    "collect_trajectories",
+    "make_dataset",
+    "CEMConfig",
+    "CEMPlanner",
+    "create_planner",
+]

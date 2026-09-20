@@ -1,43 +1,39 @@
-#!/usr/bin/env python
 """LeWorldModel JAX - Demo & Training Script
 
 Usage:
     # Quick demo with simple 2D environment
-    python -m lewm_jax.demo --mode demo
+    python -m lewm.demo --mode demo
 
     # Train on gym environment
-    python -m lewm_jax.demo --mode train --env PushT-v1 --episodes 500
+    python -m lewm.demo --mode train --env gym_pusht/PushT-v0 --episodes 500
 
     # Train and plan
-    python -m lewm_jax.demo --mode train_plan --env PushT-v1
+    python -m lewm.demo --mode train_plan --env gym_pusht/PushT-v0
 """
 
 import argparse
-import sys
-from pathlib import Path
+import os
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import wandb
-from tqdm import tqdm
+from flax import nnx
 
-from lewm_jax import (
-    LeWorldModel,
-    Trainer,
+from lewm import (
     CEMPlanner,
-    Simple2DEnv,
-    GymEnvWrapper,
     EnvConfig,
+    GymEnvWrapper,
+    LeWorldModel,
+    SIGReg,
+    Simple2DEnv,
+    Trainer,
     collect_trajectories,
     make_dataset,
-    TrainConfig,
-    CEMConfig,
+    create_planner,
 )
 
 
 def demo_simple():
-    """Quick demo with Simple2DEnv"""
     print("=" * 60)
     print("LeWorldModel JAX - Simple 2D Demo")
     print("=" * 60)
@@ -51,7 +47,7 @@ def demo_simple():
         history_size=3,
         seed=42,
     )
-    print(f"   Model params: {sum(p.size for p in nnx.state(model).flat_values())}")
+    print(f"   Model params: {sum(p.size for p in jax.tree.leaves(jax.tree.map(lambda x: x, model))) if hasattr(model, 'params') else 'N/A'}")
 
     # Create environment
     print("\n2. Creating environment...")
@@ -76,19 +72,26 @@ def demo_simple():
 
     # Quick training
     print("\n5. Training (100 steps)...")
+    sigreg_fn = SIGReg(
+        knots=model.config.sigreg_knots,
+        num_proj=model.config.sigreg_num_proj,
+        embed_dim=model.config.embed_dim,
+    )
     trainer = Trainer.create(
         model,
         train_iter,
         max_steps=100,
+        warmup_steps=10,
         lr=1e-4,
         batch_size=32,
         log_every=20,
+        sigreg_weight=model.config.sigreg_weight,
     )
-    trainer.train(num_steps=100)
+    trainer.train(num_steps=100, sigreg_fn=sigreg_fn)
 
     # Test planning
     print("\n6. Testing planning...")
-    planner = CEMPlanner.create(model, horizon=5, num_samples=50, num_iterations=5)
+    planner = create_planner(model, horizon=5, num_samples=50, num_iterations=5)
 
     # Get initial and goal observations
     init_obs, _ = env.reset(seed=123)
@@ -113,7 +116,6 @@ def demo_simple():
 
 
 def train_on_gym(env_id: str, episodes: int = 500, steps: int = 20000):
-    """Train on a gym environment"""
     print(f"\nTraining on {env_id}...")
 
     # Setup
@@ -143,9 +145,15 @@ def train_on_gym(env_id: str, episodes: int = 500, steps: int = 20000):
         history_size=3,
         seed=42,
     )
-    print(f"Model params: {sum(p.size for p in nnx.state(model).flat_values()):,}")
+    n_params = sum(p.size for p in jax.tree.leaves(nnx.state(model, nnx.Param)))
+    print(f"Model params: {n_params:,}")
 
     # Trainer
+    sigreg_fn = SIGReg(
+        knots=model.config.sigreg_knots,
+        num_proj=model.config.sigreg_num_proj,
+        embed_dim=model.config.embed_dim,
+    )
     trainer = Trainer.create(
         model,
         train_iter,
@@ -155,53 +163,80 @@ def train_on_gym(env_id: str, episodes: int = 500, steps: int = 20000):
         log_every=100,
         eval_every=1000,
         save_every=5000,
-        checkpoint_dir=f"./checkpoints/{env_id}",
+        checkpoint_dir=f"./checkpoints/{env_id.replace('/', '__')}",
+        sigreg_weight=model.config.sigreg_weight,
     )
 
-    # Initialize wandb
-    wandb.init(
-        project="lewm-jax",
-        name=f"{env_id}-train",
-        config={
-            "env": env_id,
-            "episodes": episodes,
-            "steps": steps,
-            "embed_dim": 192,
-        },
-    )
+    # Initialize wandb (fall back to offline, and never crash if unavailable)
+    wandb_run = None
+    try:
+        if not os.environ.get("WANDB_API_KEY") and not os.environ.get("WANDB_MODE"):
+            os.environ["WANDB_MODE"] = "offline"
+        wandb_run = wandb.init(
+            project="lewm-jax",
+            name=f"{env_id}-train",
+            config={
+                "env": env_id,
+                "episodes": episodes,
+                "steps": steps,
+                "embed_dim": 192,
+            },
+        )
+    except Exception as e:
+        print(f"  (wandb init failed: {type(e).__name__}: {e}; continuing without logging)")
 
     # Train
-    trainer.train()
-
-    wandb.finish()
-    env.close()
+    try:
+        trainer.train(sigreg_fn=sigreg_fn)
+    finally:
+        if wandb_run is not None:
+            wandb.finish()
+        env.close()
     return model
 
 
-def train_and_plan(env_id: str):
-    """Train model and test planning"""
-    model = train_on_gym(env_id, episodes=200, steps=10000)
+def train_and_plan(env_id: str, episodes: int = 200, steps: int = 10000):
+    model = train_on_gym(env_id, episodes=episodes, steps=steps)
 
     # Test planning
     env_config = EnvConfig(env_id=env_id, img_size=64)
     env = GymEnvWrapper(env_config)
 
-    planner = CEMPlanner.create(
+    # Use the environment's actual action space for CEM sampling
+    act_dim = int(env.action_space.shape[0])
+    act_low = float(env.action_space.low.min())
+    act_high = float(env.action_space.high.max())
+    planner = create_planner(
         model,
         horizon=10,
         num_samples=300,
         num_iterations=10,
+        action_dim=act_dim,
+        action_min=act_low,
+        action_max=act_high,
     )
 
-    # Get init and goal from env
-    init_obs, _ = env.reset(seed=1)
+    # Build a short frame history so the model has context to plan from
+    hist_len = model.config.history_size
+    env.reset(seed=1)
     goal_obs, _ = env.reset(seed=2)
 
+    init_obs, _ = env.reset(seed=1)
+    history = [init_obs]
+    for _ in range(hist_len - 1):
+        obs, _, term, trunc, _ = env.step(env.action_space.sample())
+        history.append(obs)
+        if term or trunc:
+            break
+    init_hist = np.stack(history)  # (T, H, W, C) - history frames
+
     print("\nPlanning to goal...")
-    actions = planner.plan(init_obs, goal_obs)
+    actions = planner.plan(init_hist, goal_obs)
 
     print("Executing plan...")
     env.reset(seed=1)
+    for _ in range(hist_len - 1):
+        env.step(env.action_space.sample())
     for i, action in enumerate(actions):
         obs, reward, term, trunc, _ = env.step(np.array(action))
         print(f"  Step {i}: reward={reward:.3f}")
@@ -223,8 +258,8 @@ def main():
     parser.add_argument(
         "--env",
         type=str,
-        default="PushT-v1",
-        help="Gym environment ID",
+        default="gym_pusht/PushT-v0",
+        help="Gym environment ID (e.g. gym_pusht/PushT-v0)",
     )
     parser.add_argument(
         "--episodes",
@@ -256,10 +291,8 @@ def main():
     elif args.mode == "train":
         train_on_gym(args.env, args.episodes, args.steps)
     elif args.mode == "train_plan":
-        train_and_plan(args.env)
+        train_and_plan(args.env, args.episodes, args.steps)
 
 
 if __name__ == "__main__":
-    # Import nnx here to avoid circular import
-    from flax import nnx
     main()

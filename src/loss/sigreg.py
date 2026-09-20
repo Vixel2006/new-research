@@ -1,23 +1,28 @@
-"""SIGReg: Sketched Isotropic Gaussian Regularizer"""
-
 import jax
 import jax.numpy as jnp
 from flax import nnx
 
 
 class SIGReg(nnx.Module):
-    """Enforces latent embeddings to match isotropic Gaussian via Epps-Pulley statistic."""
-
-    def __init__(self, knots: int = 17, num_proj: int = 1024, rngs: nnx.Rngs = None):
+    def __init__(self, knots: int = 17, num_proj: int = 1024, rngs: nnx.Rngs = None, embed_dim: int = None):
         self.num_proj = num_proj
         t = jnp.linspace(0, 3, knots, dtype=jnp.float32)
         dt = 3.0 / (knots - 1)
         weights = jnp.full((knots,), 2 * dt, dtype=jnp.float32)
         weights = weights.at[0].set(dt).at[-1].set(dt)
-        window = jnp.exp(-t**2 / 2.0)
+        window = jnp.exp(-(t**2) / 2.0)
         self.t = t
         self.phi = window
         self.weights = weights * window
+
+        # Fixed random projection matrix - sample at init if embed_dim is known
+        if embed_dim is not None:
+            key = jax.random.key(42)
+            A = jax.random.normal(key, (embed_dim, num_proj))
+            A = A / jnp.linalg.norm(A, axis=0, keepdims=True)
+            self.A = A
+        else:
+            self.A = None
 
     def __call__(self, embeddings: jax.Array) -> jax.Array:
         """
@@ -26,15 +31,16 @@ class SIGReg(nnx.Module):
         Returns:
             scalar loss
         """
-        T, B, D = embeddings.shape
+        T, _, D = embeddings.shape
 
-        # Sample random projection directions
-        key = jax.random.key(int.from_bytes(jax.random.key_data(jax.random.key(0))[:8], 'little'))
-        A = jax.random.normal(key, (D, self.num_proj))
-        A = A / jnp.linalg.norm(A, axis=0, keepdims=True)
+        # Use stored projection matrix (must be initialized with correct D)
+        if self.A is None:
+            raise ValueError("SIGReg projection matrix not initialized. Provide embed_dim at construction.")
+        if self.A.shape[0] != D:
+            raise ValueError(f"SIGReg projection matrix has wrong shape: {self.A.shape[0]} != {D}")
 
         # Project: (T, B, D) @ (D, M) -> (T, B, M)
-        proj = embeddings @ A
+        proj = embeddings @ self.A
 
         # Epps-Pulley statistic
         # x_t: (T, B, M, K)

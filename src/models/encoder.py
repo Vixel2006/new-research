@@ -1,23 +1,32 @@
-"""Simple CNN Encoder for LeWorldModel (replaces ViT)"""
-
-from flax import nnx
-import jax.numpy as jnp
 import jax
+import jax.numpy as jnp
+from flax import nnx
 
 
 class CNNEncoder(nnx.Module):
-    """Lightweight CNN encoder: (B, H, W, C) -> (B, D)"""
-
     def __init__(
         self,
         embed_dim: int = 192,
         in_channels: int = 3,
         rngs: nnx.Rngs = None,
     ):
-        self.conv1 = nnx.Conv(in_channels, 32, kernel_size=(4, 4), strides=(2, 2), padding="SAME", rngs=rngs)
-        self.conv2 = nnx.Conv(32, 64, kernel_size=(4, 4), strides=(2, 2), padding="SAME", rngs=rngs)
-        self.conv3 = nnx.Conv(64, 128, kernel_size=(4, 4), strides=(2, 2), padding="SAME", rngs=rngs)
-        self.conv4 = nnx.Conv(128, 256, kernel_size=(4, 4), strides=(2, 2), padding="SAME", rngs=rngs)
+        self.conv1 = nnx.Conv(
+            in_channels,
+            32,
+            kernel_size=(4, 4),
+            strides=(2, 2),
+            padding="SAME",
+            rngs=rngs,
+        )
+        self.conv2 = nnx.Conv(
+            32, 64, kernel_size=(4, 4), strides=(2, 2), padding="SAME", rngs=rngs
+        )
+        self.conv3 = nnx.Conv(
+            64, 128, kernel_size=(4, 4), strides=(2, 2), padding="SAME", rngs=rngs
+        )
+        self.conv4 = nnx.Conv(
+            128, 256, kernel_size=(4, 4), strides=(2, 2), padding="SAME", rngs=rngs
+        )
 
         self.norm1 = nnx.LayerNorm(32, rngs=rngs)
         self.norm2 = nnx.LayerNorm(64, rngs=rngs)
@@ -35,9 +44,8 @@ class CNNEncoder(nnx.Module):
         Returns:
             (B, embed_dim)
         """
-        # Normalize to [-1, 1] if needed
-        if x.max() > 1.0:
-            x = x / 127.5 - 1.0
+        # Normalize to [-1, 1] if needed (handle both [0,1] and [0,255])
+        x = jnp.where(x.max() > 1.0, x / 127.5 - 1.0, x * 2.0 - 1.0)
 
         x = nnx.relu(self.norm1(self.conv1(x)))
         x = nnx.relu(self.norm2(self.conv2(x)))
@@ -54,8 +62,6 @@ class CNNEncoder(nnx.Module):
 
 
 class ActionEncoder(nnx.Module):
-    """Encodes action sequence: (B, T, action_dim) -> (B, T, embed_dim)"""
-
     def __init__(
         self,
         action_dim: int,
@@ -63,7 +69,14 @@ class ActionEncoder(nnx.Module):
         hidden_mult: int = 4,
         rngs: nnx.Rngs = None,
     ):
-        self.conv = nnx.Conv(action_dim, embed_dim, kernel_size=(1,), strides=(1,), rngs=rngs)
+        # nnx.Conv expects channels-last: (B, L, C_in) -> (B, L, C_out)
+        self.conv = nnx.Conv(
+            in_features=action_dim,
+            out_features=embed_dim,
+            kernel_size=(1,),
+            strides=(1,),
+            rngs=rngs,
+        )
         self.mlp = nnx.Sequential(
             nnx.Linear(embed_dim, hidden_mult * embed_dim, rngs=rngs),
             nnx.silu,
@@ -77,16 +90,12 @@ class ActionEncoder(nnx.Module):
         Returns:
             (B, T, embed_dim)
         """
-        # (B, T, D) -> (B, D, T) for Conv1d
-        x = jnp.transpose(actions, (0, 2, 1))
-        x = self.conv(x)
-        x = jnp.transpose(x, (0, 2, 1))  # (B, T, D)
+        # nnx.Conv expects channels-last: (B, T, action_dim) -> (B, T, embed_dim)
+        x = self.conv(actions)
         return self.mlp(x)
 
 
 class Projector(nnx.Module):
-    """MLP projector with BatchNorm (as in paper)"""
-
     def __init__(
         self,
         input_dim: int,

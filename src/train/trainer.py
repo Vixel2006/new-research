@@ -1,22 +1,20 @@
-"""Training loop with optax and orbax checkpointing"""
+from collections.abc import Iterator
+from dataclasses import dataclass
+from pathlib import Path
 
-import optax
-import orbax.checkpoint as ocp
-from flax import nnx
-import jax
 import jax.numpy as jnp
 import numpy as np
-from dataclasses import dataclass
-from typing import Iterator, Optional
-from pathlib import Path
-import time
-from tqdm import tqdm
+import optax
+import orbax.checkpoint as ocp
 import wandb
+from flax import nnx
+from tqdm import tqdm
+
+from ..models import LeWorldModel
 
 
 @dataclass
 class TrainConfig:
-    """Training configuration"""
     # Model
     embed_dim: int = 192
     img_size: int = 64
@@ -48,11 +46,11 @@ class TrainConfig:
 
 
 def create_optimizer(config: TrainConfig) -> optax.GradientTransformation:
-    """Create optimizer with warmup and cosine decay"""
+    warmup_steps = min(config.warmup_steps, max(0, config.max_steps - 1))
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=config.lr,
-        warmup_steps=config.warmup_steps,
+        warmup_steps=warmup_steps,
         decay_steps=config.max_steps,
         end_value=config.lr * 0.01,
     )
@@ -67,33 +65,30 @@ def train_step(
     model: nnx.Module,
     optimizer: nnx.Optimizer,
     batch: dict,
+    sigreg_fn,
 ) -> dict:
-    """Single training step"""
-
-    def loss_fn(model: nnx.Module):
-        losses = model.compute_loss(batch["pixels"], batch["actions"])
+    def loss_fn(model: LeWorldModel):
+        losses = model.compute_loss(batch["pixels"], batch["actions"], sigreg_fn)
         return losses["loss"], losses
 
     (loss, losses), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
-    optimizer.update(grads)
+    optimizer.update(model, grads)
     return losses
 
 
 @nnx.jit
-def eval_step(model: nnx.Module, batch: dict) -> dict:
+def eval_step(model: LeWorldModel, batch: dict, sigreg_fn) -> dict:
     """Evaluation step (no gradients)"""
-    return model.compute_loss(batch["pixels"], batch["actions"])
+    return model.compute_loss(batch["pixels"], batch["actions"], sigreg_fn)
 
 
 class Trainer:
-    """LeWorldModel Trainer"""
-
     def __init__(
         self,
-        model: nnx.Module,
+        model: LeWorldModel,
         config: TrainConfig,
         train_iter: Iterator,
-        val_iter: Optional[Iterator] = None,
+        val_iter: Iterator | None = None,
         seed: int = 0,
     ):
         self.model = model
@@ -103,12 +98,15 @@ class Trainer:
         self.step = 0
 
         # Optimizer
-        self.optimizer = nnx.Optimizer(model, create_optimizer(config))
+        self.optimizer = nnx.Optimizer(model, create_optimizer(config), wrt=nnx.Param)
+
+        # SIGReg
+        self.sigreg_fn = model.config if hasattr(model, "config") else None
 
         # Checkpointing
-        self.checkpoint_dir = Path(config.checkpoint_dir)
+        self.checkpoint_dir = Path(config.checkpoint_dir).resolve()
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        self.checkpointer = ocp.PyTreeCheckpointer()
+        self.checkpointer = ocp.StandardCheckpointer()
         self.checkpoint_manager = ocp.CheckpointManager(
             self.checkpoint_dir,
             self.checkpointer,
@@ -119,13 +117,25 @@ class Trainer:
         self.train_losses = []
         self.val_losses = []
 
-    def train_step(self, batch: dict) -> dict:
+    @classmethod
+    def create(
+        cls,
+        model: LeWorldModel,
+        train_data: Iterator,
+        val_data: Iterator | None = None,
+        **kwargs,
+    ) -> "Trainer":
+        """Factory method to create Trainer with default config."""
+        config = TrainConfig(**kwargs)
+        return cls(model, config, train_data, val_data)
+
+    def train_step(self, batch: dict, sigreg_fn) -> dict:
         """Run one training step"""
-        losses = train_step(self.model, self.optimizer, batch)
+        losses = train_step(self.model, self.optimizer, batch, sigreg_fn)
         self.step += 1
         return losses
 
-    def evaluate(self, num_batches: int = 10) -> dict:
+    def evaluate(self, sigreg_fn, num_batches: int = 10) -> dict:
         """Run evaluation"""
         if self.val_iter is None:
             return {}
@@ -136,7 +146,7 @@ class Trainer:
                 batch = next(self.val_iter)
             except StopIteration:
                 break
-            losses = eval_step(self.model, batch)
+            losses = eval_step(self.model, batch, sigreg_fn)
             val_losses.append(losses)
 
         if not val_losses:
@@ -149,39 +159,63 @@ class Trainer:
         return avg_losses
 
     def save_checkpoint(self):
-        """Save model checkpoint"""
-        state = {
-            "model": self.model,
-            "optimizer": self.optimizer,
-            "step": self.step,
-            "config": self.config,
-        }
-        self.checkpoint_manager.save(self.step, args=ocp.args.StandardSave(state))
-        print(f"Saved checkpoint at step {self.step}")
+        try:
+            # orbax cannot serialize nnx.Modules or PRNG keys natively, so we
+            # convert the (Param-only) model state and optimizer state to plain
+            # pytrees of arrays first.
+            state = {
+                "model": nnx.to_pure_dict(nnx.state(self.model, nnx.Param)),
+                "optimizer": nnx.to_pure_dict(nnx.state(self.optimizer)),
+                "step": self.step,
+            }
+            self.checkpoint_manager.save(self.step, args=ocp.args.StandardSave(state))
+            print(f"Saved checkpoint at step {self.step}")
+        except Exception as e:
+            msg = str(e).splitlines()[0] if str(e) else type(e).__name__
+            print(f"Checkpoint save failed (non-fatal): {type(e).__name__}: {msg}")
 
-    def load_checkpoint(self, step: Optional[int] = None):
-        """Load model checkpoint"""
+    def load_checkpoint(self, step: int | None = None):
         if step is None:
             step = self.checkpoint_manager.latest_step()
         if step is None:
             print("No checkpoint found")
             return
 
-        state = {
-            "model": self.model,
-            "optimizer": self.optimizer,
-            "step": 0,
-            "config": self.config,
-        }
-        restored = self.checkpoint_manager.restore(step, args=ocp.args.StandardRestore(state))
-        self.model = restored["model"]
-        self.optimizer = restored["optimizer"]
-        self.step = restored["step"]
-        print(f"Loaded checkpoint at step {self.step}")
+        try:
+            # Restore into structure-matching templates (orbax requires the
+            # provided target tree to match what was saved).
+            template = {
+                "model": nnx.to_pure_dict(nnx.state(self.model, nnx.Param)),
+                "optimizer": nnx.to_pure_dict(nnx.state(self.optimizer)),
+                "step": 0,
+            }
+            restored = self.checkpoint_manager.restore(
+                step, args=ocp.args.StandardRestore(template)
+            )
+            nnx.update(self.model, nnx.State(restored["model"]))
+            nnx.update(self.optimizer, nnx.State(restored["optimizer"]))
+            self.step = int(np.asarray(restored["step"]))
+            print(f"Loaded checkpoint at step {self.step}")
+        except Exception as e:
+            msg = str(e).splitlines()[0] if str(e) else type(e).__name__
+            print(f"Checkpoint load failed: {type(e).__name__}: {msg}")
 
-    def train(self, num_steps: Optional[int] = None):
-        """Main training loop"""
+    def train(self, num_steps: int | None = None, sigreg_fn=None):
         num_steps = num_steps or self.config.max_steps
+
+        if sigreg_fn is None:
+            # Import here to avoid circular import
+            from ..loss.sigreg import SIGReg
+
+            sigreg_fn = SIGReg(
+                knots=self.config.sigreg_knots
+                if hasattr(self.config, "sigreg_knots")
+                else 17,
+                num_proj=self.config.sigreg_num_proj
+                if hasattr(self.config, "sigreg_num_proj")
+                else 1024,
+                embed_dim=self.model.config.embed_dim,
+            )
 
         pbar = tqdm(total=num_steps, initial=self.step, desc="Training")
 
@@ -193,7 +227,7 @@ class Trainer:
                 continue
 
             # Training step
-            losses = self.train_step(batch)
+            losses = self.train_step(batch, sigreg_fn)
             self.train_losses.append(losses)
 
             # Logging
@@ -206,11 +240,14 @@ class Trainer:
 
             # Evaluation
             if self.val_iter is not None and self.step % self.config.eval_every == 0:
-                val_losses = self.evaluate()
+                val_losses = self.evaluate(sigreg_fn)
                 if val_losses:
                     self.val_losses.append(val_losses)
                     if wandb.run is not None:
-                        wandb.log({f"val/{k}": v for k, v in val_losses.items()}, step=self.step)
+                        wandb.log(
+                            {f"val/{k}": v for k, v in val_losses.items()},
+                            step=self.step,
+                        )
                     print(f"Step {self.step} | Val: {val_losses}")
 
             # Checkpoint
@@ -224,11 +261,10 @@ class Trainer:
 
 
 def create_trainer(
-    model: nnx.Module,
+    model: LeWorldModel,
     train_data: Iterator,
-    val_data: Optional[Iterator] = None,
+    val_data: Iterator | None = None,
     **kwargs,
 ) -> Trainer:
-    """Factory function to create trainer with config"""
     config = TrainConfig(**kwargs)
     return Trainer(model, config, train_data, val_data)

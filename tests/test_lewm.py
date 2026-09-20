@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
-from lewm_jax import (
+from lewm import (
     LeWorldModel,
     SIGReg,
     CNNEncoder,
@@ -14,14 +14,14 @@ from lewm_jax import (
     Simple2DEnv,
     collect_trajectories,
     make_dataset,
-    CEMPlanner,
+    create_planner,
 )
 
 
 def test_sigreg():
     """Test SIGReg regularizer"""
     print("Testing SIGReg...")
-    sigreg = SIGReg(knots=17, num_proj=128, rngs=nnx.Rngs(0))
+    sigreg = SIGReg(knots=17, num_proj=128, embed_dim=192)
 
     # Random embeddings
     embeddings = jax.random.normal(jax.random.key(0), (10, 32, 192))  # (T, B, D)
@@ -96,7 +96,7 @@ def test_full_model():
     pixels = jax.random.uniform(jax.random.key(0), (4, 4, 64, 64, 3))
     actions = jax.random.normal(jax.random.key(1), (4, 4, 2))
 
-    losses = model.compute_loss(pixels, actions)
+    losses = model.compute_loss(pixels, actions, SIGReg(embed_dim=128))
     print(f"  Losses: {losses}")
     assert "loss" in losses
     assert "pred_loss" in losses
@@ -148,7 +148,7 @@ def test_planner():
     """Test CEM Planner"""
     print("\nTesting CEM Planner...")
     model = LeWorldModel.create(embed_dim=64, img_size=64, action_dim=2, history_size=3, seed=0)
-    planner = CEMPlanner.create(model, horizon=5, num_samples=20, num_iterations=3)
+    planner = create_planner(model, horizon=5, num_samples=20, num_iterations=3)
 
     init_obs = jax.random.uniform(jax.random.key(0), (1, 64, 64, 3))
     goal_obs = jax.random.uniform(jax.random.key(1), (1, 64, 64, 3))
@@ -162,7 +162,7 @@ def test_planner():
 def test_training_step():
     """Test a few training steps"""
     print("\nTesting Training Step...")
-    from lewm_jax import Trainer, TrainConfig
+    from lewm import Trainer, TrainConfig
 
     model = LeWorldModel.create(embed_dim=64, img_size=64, action_dim=2, history_size=3, seed=0)
     env = Simple2DEnv(img_size=64)
@@ -171,10 +171,11 @@ def test_training_step():
 
     config = TrainConfig(max_steps=10, lr=1e-4, batch_size=4)
     trainer = Trainer(model, config, train_iter)
+    sigreg_fn = SIGReg(embed_dim=64)
 
     for i in range(3):
         batch = next(train_iter)
-        losses = trainer.train_step(batch)
+        losses = trainer.train_step(batch, sigreg_fn)
         print(f"  Step {i}: loss={losses['loss']:.4f}, pred={losses['pred_loss']:.4f}, sigreg={losses['sigreg_loss']:.4f}")
 
     env.close()

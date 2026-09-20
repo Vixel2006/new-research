@@ -1,8 +1,6 @@
-"""Autoregressive Predictor with AdaLN-zero conditioning"""
-
-from flax import nnx
-import jax.numpy as jnp
 import jax
+import jax.numpy as jnp
+from flax import nnx
 
 
 def modulate(x: jax.Array, shift: jax.Array, scale: jax.Array) -> jax.Array:
@@ -11,8 +9,6 @@ def modulate(x: jax.Array, shift: jax.Array, scale: jax.Array) -> jax.Array:
 
 
 class AdaLNBlock(nnx.Module):
-    """Transformer block with AdaLN-zero conditioning"""
-
     def __init__(
         self,
         dim: int,
@@ -45,8 +41,9 @@ class AdaLNBlock(nnx.Module):
             nnx.Linear(dim, 6 * dim, rngs=rngs),
         )
         # Zero init for progressive action conditioning
-        self.ada_ln[-1].kernel = nnx.Param(jnp.zeros_like(self.ada_ln[-1].kernel.value))
-        self.ada_ln[-1].bias = nnx.Param(jnp.zeros_like(self.ada_ln[-1].bias.value))
+        linear = self.ada_ln.layers[-1]
+        linear.kernel = nnx.Param(jnp.zeros_like(linear.kernel.value))
+        linear.bias = nnx.Param(jnp.zeros_like(linear.bias.value))
 
     def __call__(
         self,
@@ -62,12 +59,14 @@ class AdaLNBlock(nnx.Module):
         """
         # AdaLN modulation parameters
         mod = self.ada_ln(cond)  # (B, T, 6*D)
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(mod, 6, axis=-1)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(
+            mod, 6, axis=-1
+        )
 
         # Attention with modulation
         h = self.norm1(x)
         h = modulate(h, shift_msa, scale_msa)
-        h = self.attn(h, h, h, mask=mask)
+        h = self.attn(h, h, h, mask=mask, decode=False, deterministic=True)
         x = x + gate_msa * h
 
         # MLP with modulation
@@ -80,8 +79,6 @@ class AdaLNBlock(nnx.Module):
 
 
 class ARPredictor(nnx.Module):
-    """Autoregressive predictor for next-step embedding prediction"""
-
     def __init__(
         self,
         embed_dim: int = 192,
@@ -103,10 +100,12 @@ class ARPredictor(nnx.Module):
         self.pos_dropout = nnx.Dropout(emb_dropout, rngs=rngs)
 
         # Transformer blocks with AdaLN
-        self.blocks = [
-            AdaLNBlock(embed_dim, num_heads, mlp_dim, dropout, rngs=rngs)
-            for _ in range(depth)
-        ]
+        self.blocks = nnx.List(
+            [
+                AdaLNBlock(embed_dim, num_heads, mlp_dim, dropout, rngs=rngs)
+                for _ in range(depth)
+            ]
+        )
 
         self.norm = nnx.LayerNorm(embed_dim, rngs=rngs)
 
@@ -127,7 +126,7 @@ class ARPredictor(nnx.Module):
         Returns:
             (B, T, D) - predicted next embeddings
         """
-        B, T, D = embeddings.shape
+        _, T, _ = embeddings.shape
         assert T <= self.num_frames, f"T={T} > num_frames={self.num_frames}"
 
         # Add positional embedding
@@ -144,8 +143,6 @@ class ARPredictor(nnx.Module):
 
 
 class PredictorProjector(nnx.Module):
-    """Projector for predictor outputs (same as encoder projector)"""
-
     def __init__(
         self,
         input_dim: int,

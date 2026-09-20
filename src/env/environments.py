@@ -1,17 +1,14 @@
-"""Gym environment wrapper and data collection for LeWorldModel"""
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import gymnasium as gym
-import numpy as np
-from dataclasses import dataclass
-from typing import Optional, Callable
 import jax.numpy as jnp
-import jax
+import numpy as np
 
 
 @dataclass
 class EnvConfig:
-    """Environment configuration"""
-    env_id: str = "PushT-v1"  # or custom
+    env_id: str = "gym_pusht/PushT-v0"  # or custom
     img_size: int = 64
     frameskip: int = 5
     max_episode_steps: int = 200
@@ -19,14 +16,25 @@ class EnvConfig:
 
 
 class GymEnvWrapper:
-    """Wrapper for gym environments to collect trajectories"""
-
     def __init__(self, config: EnvConfig):
         self.config = config
-        self.env = gym.make(config.env_id, render_mode=config.render_mode)
+        try:
+            self.env = gym.make(config.env_id, render_mode=config.render_mode)
+        except gym.error.NamespaceNotFound:
+            # Plugin envs (e.g. gym_pusht) are only registered when their
+            # package is imported. Try importing the namespace module.
+            ns = config.env_id.split("/")[0]
+            try:
+                __import__(ns)
+            except ImportError as e:
+                raise gym.error.NamespaceNotFound(
+                    f"Namespace {ns} not found and package '{ns}' could not be "
+                    f"imported. Install it (e.g. pip install {ns})."
+                ) from e
+            self.env = gym.make(config.env_id, render_mode=config.render_mode)
         self.img_size = config.img_size
 
-    def reset(self, seed: Optional[int] = None):
+    def reset(self, seed: int | None = None):
         obs, info = self.env.reset(seed=seed)
         return self._process_obs(obs), info
 
@@ -42,6 +50,7 @@ class GymEnvWrapper:
 
     def _process_obs(self, obs):
         """Process observation to (H, W, C) uint8"""
+        img = None
         if isinstance(obs, dict):
             # Handle dict observations (e.g., with pixels key)
             if "pixels" in obs:
@@ -54,8 +63,26 @@ class GymEnvWrapper:
                     if isinstance(v, np.ndarray) and v.ndim >= 2:
                         img = v
                         break
+        elif isinstance(obs, np.ndarray):
+            if obs.ndim >= 2:
+                img = obs
+            else:
+                # State-based observation (1D vector) - use rendered frame
+                img = None
         else:
-            img = obs
+            img = None
+
+        if img is None:
+            # State-based obs: render the current frame
+            rendered = self.env.render()
+            if rendered is None and hasattr(self.env, "unwrapped"):
+                rendered = self.env.unwrapped.render()
+            if rendered is None:
+                raise ValueError(
+                    f"Observation is state-based (shape {obs.shape}) and render() returned None. "
+                    "Use an environment that provides image observations."
+                )
+            img = np.array(rendered)
 
         # Ensure 3 channels
         if img.ndim == 2:
@@ -68,6 +95,7 @@ class GymEnvWrapper:
         # Resize if needed
         if img.shape[:2] != (self.img_size, self.img_size):
             from PIL import Image
+
             img = np.array(Image.fromarray(img).resize((self.img_size, self.img_size)))
 
         return img.astype(np.uint8)
@@ -90,8 +118,8 @@ class GymEnvWrapper:
 def collect_trajectories(
     env: GymEnvWrapper,
     num_episodes: int,
-    policy: Optional[Callable] = None,
-    max_steps: Optional[int] = None,
+    policy: Callable | None = None,
+    max_steps: int | None = None,
     seed: int = 0,
 ) -> dict:
     """
@@ -141,7 +169,6 @@ def collect_trajectories(
 
     # Pad to same length
     max_len = max(len(p) for p in all_pixels)
-    action_dim = all_actions[0].shape[-1]
 
     def pad_seq(seq, max_len, pad_value=0):
         if len(seq) >= max_len:
@@ -150,7 +177,9 @@ def collect_trajectories(
         return np.concatenate([seq, np.full(pad_shape, pad_value, dtype=seq.dtype)])
 
     pixels = np.stack([pad_seq(p, max_len) for p in all_pixels])  # (N, T, H, W, C)
-    actions = np.stack([pad_seq(a, max_len - 1, 0) for a in all_actions])  # (N, T-1, action_dim)
+    actions = np.stack(
+        [pad_seq(a, max_len - 1, 0) for a in all_actions]
+    )  # (N, T-1, action_dim)
     rewards = np.stack([pad_seq(r, max_len - 1, 0) for r in all_rewards])
     dones = np.stack([pad_seq(d, max_len, True) for d in all_dones])
 
@@ -173,42 +202,56 @@ def make_dataset(
     """
     Create batched dataset from trajectories for LeWM training.
     Each sample: (pixels: (H, W, C), actions: (action_dim)) x (history_size + num_preds)
+    Returns a callable that yields batches (can be called multiple times for multiple epochs).
     """
     pixels = trajectories["pixels"]  # (N, T, H, W, C)
     actions = trajectories["actions"]  # (N, T-1, action_dim)
 
-    N, T, H, W, C = pixels.shape
+    N, T, _, _, _ = pixels.shape
     seq_len = history_size + num_preds
 
     # Create sliding windows
     windows = []
     for i in range(N):
         for t in range(T - seq_len + 1):
-            pix_window = pixels[i, t:t+seq_len]  # (seq_len, H, W, C)
-            act_window = actions[i, t:t+seq_len-1]  # (seq_len-1, action_dim)
+            pix_window = pixels[i, t : t + seq_len]  # (seq_len, H, W, C)
+            act_window = actions[i, t : t + seq_len - 1]  # (seq_len-1, action_dim)
             # Pad actions to seq_len (last action repeated)
             act_padded = np.concatenate([act_window, act_window[-1:]], axis=0)
             windows.append((pix_window, act_padded))
 
     pixels_batch = np.stack([w[0] for w in windows])  # (num_windows, seq_len, H, W, C)
-    actions_batch = np.stack([w[1] for w in windows])  # (num_windows, seq_len, action_dim)
+    actions_batch = np.stack(
+        [w[1] for w in windows]
+    )  # (num_windows, seq_len, action_dim)
 
     # Normalize pixels to [0, 1]
     pixels_batch = pixels_batch.astype(np.float32) / 255.0
 
-    # Create batches
     num_windows = len(windows)
-    indices = np.arange(num_windows)
-    if shuffle:
-        np.random.seed(seed)
-        np.random.shuffle(indices)
 
-    for i in range(0, num_windows, batch_size):
-        idx = indices[i:i+batch_size]
-        yield {
-            "pixels": jnp.array(pixels_batch[idx]),
-            "actions": jnp.array(actions_batch[idx]),
-        }
+    def batch_generator(epoch: int = 0):
+        """Generate batches for a given epoch"""
+        indices = np.arange(num_windows)
+        if shuffle:
+            np.random.seed(seed + epoch)
+            np.random.shuffle(indices)
+
+        for i in range(0, num_windows, batch_size):
+            idx = indices[i : i + batch_size]
+            yield {
+                "pixels": jnp.array(pixels_batch[idx]),
+                "actions": jnp.array(actions_batch[idx]),
+            }
+
+    # Return infinite iterator that cycles through epochs
+    def infinite_iterator():
+        epoch = 0
+        while True:
+            yield from batch_generator(epoch)
+            epoch += 1
+
+    return infinite_iterator()
 
 
 class Simple2DEnv:
@@ -220,7 +263,9 @@ class Simple2DEnv:
         self.block_pos = np.array([0.3, 0.3])
         self.target_pos = np.array([0.7, 0.7])
         self.action_space = gym.spaces.Box(-0.1, 0.1, (2,), dtype=np.float32)
-        self.observation_space = gym.spaces.Box(0, 255, (img_size, img_size, 3), dtype=np.uint8)
+        self.observation_space = gym.spaces.Box(
+            0, 255, (img_size, img_size, 3), dtype=np.uint8
+        )
         self.step_count = 0
         self.max_steps = 100
 
@@ -256,13 +301,13 @@ class Simple2DEnv:
         img = np.zeros((self.img_size, self.img_size, 3), dtype=np.uint8)
         # Target
         tx, ty = (self.target_pos * (self.img_size - 1)).astype(int)
-        img[max(0,ty-3):ty+3, max(0,tx-3):tx+3] = [0, 255, 0]
+        img[max(0, ty - 3) : ty + 3, max(0, tx - 3) : tx + 3] = [0, 255, 0]
         # Block
         bx, by = (self.block_pos * (self.img_size - 1)).astype(int)
-        img[max(0,by-4):by+4, max(0,bx-4):bx+4] = [255, 100, 0]
+        img[max(0, by - 4) : by + 4, max(0, bx - 4) : bx + 4] = [255, 100, 0]
         # Agent
         ax, ay = (self.agent_pos * (self.img_size - 1)).astype(int)
-        img[max(0,ay-2):ay+2, max(0,ax-2):ax+2] = [0, 100, 255]
+        img[max(0, ay - 2) : ay + 2, max(0, ax - 2) : ax + 2] = [0, 100, 255]
         return img
 
     def render(self):

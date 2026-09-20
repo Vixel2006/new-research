@@ -1,16 +1,15 @@
-"""Cross-Entropy Method (CEM) planner for latent space planning"""
+from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
-from flax import nnx
-from dataclasses import dataclass
-from typing import Optional
 import numpy as np
+from flax import nnx
+
+from ..models import LeWorldModel
 
 
 @dataclass
 class CEMConfig:
-    """CEM planner configuration"""
     horizon: int = 5
     num_samples: int = 300
     num_elites: int = 30
@@ -24,11 +23,9 @@ class CEMConfig:
 
 
 class CEMPlanner:
-    """Cross-Entropy Method planner in latent space"""
-
     def __init__(
         self,
-        model: nnx.Module,
+        model: LeWorldModel,
         config: CEMConfig,
         seed: int = 0,
     ):
@@ -81,7 +78,7 @@ class CEMPlanner:
             costs = self._evaluate_actions(init_emb, goal_emb, actions)
 
             # Select elites
-            elite_idx = jnp.argsort(costs)[:cfg.num_elites]
+            elite_idx = jnp.argsort(costs)[: cfg.num_elites]
             elite_actions = actions[elite_idx]
 
             # Update distribution
@@ -105,14 +102,13 @@ class CEMPlanner:
         Returns:
             (N,) - costs
         """
-        N, H, _ = actions.shape
-        cfg = self.config
+        N, _, _ = actions.shape
 
         # Repeat init_emb for all samples
         init_emb = jnp.repeat(init_emb, N, axis=0)  # (N, H, D)
 
-        # Rollout
-        pred_emb = self.model.rollout(init_emb, actions)  # (N, H, D)
+        # Rollout in latent space (starts from pre-encoded embeddings)
+        pred_emb = self.model.rollout_from_embeddings(init_emb, actions)  # (N, T, D)
 
         # Final state cost
         final_emb = pred_emb[:, -1]  # (N, D)
@@ -151,22 +147,25 @@ class CEMPlanner:
                 all_rewards.append(reward)
 
                 if terminated or truncated:
-                    return np.array(all_actions), np.array(all_obs), np.array(all_rewards)
+                    return (
+                        np.array(all_actions),
+                        np.array(all_obs),
+                        np.array(all_rewards),
+                    )
 
                 # Update history
                 if curr_pixels.ndim == 4:
                     # Shift history window
-                    curr_pixels = jnp.concatenate([
-                        curr_pixels[:, 1:],
-                        obs[None, None]
-                    ], axis=1)
+                    curr_pixels = jnp.concatenate(
+                        [curr_pixels[:, 1:], obs[None, None]], axis=1
+                    )
                 else:
                     curr_pixels = obs
 
         return np.array(all_actions), np.array(all_obs), np.array(all_rewards)
 
 
-def create_planner(model: nnx.Module, **kwargs) -> CEMPlanner:
+def create_planner(model: LeWorldModel, **kwargs) -> CEMPlanner:
     """Factory function to create CEM planner"""
     config = CEMConfig(**kwargs)
     return CEMPlanner(model, config)
