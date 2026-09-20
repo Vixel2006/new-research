@@ -61,9 +61,16 @@ class CEMPlanner:
         # Encode initial history
         init_emb = self.model.encode(init_pixels)  # (1, H, D)
 
-        # Initialize action distribution
-        mean = jnp.zeros((cfg.horizon, cfg.action_dim))
-        var = jnp.full((cfg.horizon, cfg.action_dim), cfg.init_var)
+        # Initialize action distribution at the CENTER of the action range.
+        # A zero-mean init (e.g. old 'mean = zeros, var = 1') clips every
+        # initial sample into one corner for non-symmetric bounds like
+        # PushT's [0, 512], so the plan never explores. For a symmetric
+        # [-1, 1] space this reduces to the classic mean=0, var=1.
+        center = 0.5 * (cfg.action_min + cfg.action_max)
+        spread = 0.5 * (cfg.action_max - cfg.action_min)
+        std0 = spread * cfg.init_var
+        mean = jnp.full((cfg.horizon, cfg.action_dim), center)
+        var = jnp.full((cfg.horizon, cfg.action_dim), std0**2)
 
         for i in range(cfg.num_iterations):
             self.key, subkey = jax.random.split(self.key)
