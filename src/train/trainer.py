@@ -169,6 +169,7 @@ class Trainer:
                 "step": self.step,
             }
             self.checkpoint_manager.save(self.step, args=ocp.args.StandardSave(state))
+            self.checkpoint_manager.wait_until_finished()
             print(f"Saved checkpoint at step {self.step}")
         except Exception as e:
             msg = str(e).splitlines()[0] if str(e) else type(e).__name__
