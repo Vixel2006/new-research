@@ -1,20 +1,6 @@
-from dataclasses import dataclass
-
 import jax
 import jax.numpy as jnp
 from flax import nnx
-
-
-@dataclass
-class ViTConfig:
-    rngs: nnx.Rngs
-    in_channels: int = 3
-    trajectory: int = 4
-    img_size: int = 64
-    patch_size: int = 16
-    embed_dim: int = 192
-    num_layers: int = 12
-    num_heads: int = 3
 
 
 class PatchEmbeddings(nnx.Module):
