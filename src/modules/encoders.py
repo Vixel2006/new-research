@@ -167,10 +167,8 @@ class Embedder(nnx.Module):
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        x = x.transpose(0, 2, 1)  # (B, T, D) -> (B, D, T)
-        x = self.patch_embed(x)
-        x = x.transpose(0, 2, 1)  # (B, D, T) -> (B, T, D)
-        x = self.embed(x)
+        x = self.patch_embed(x)  # (B, T, smoothed_dim)
+        x = self.embed(x)  # (B, T, emb_dim)
         return x
 
 
