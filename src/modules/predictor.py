@@ -101,8 +101,8 @@ class ARPredictor(nnx.Module):
         )
 
         # Head projector mirrors the encoder's projection (BN + Linear), per the
-        # paper. BN sees the whole (B, T) sequence as its batch; pass
-        # use_running_average=True for deployment/rollout (fixed statistics).
+        # paper. LeJEPA-style BatchNorm: current-batch statistics only (no
+        # running average), so train and inference always use the same transform.
         self.head_norm = nnx.BatchNorm(embed_dim, rngs=rngs)
         self.head = nnx.Linear(embed_dim, embed_dim, rngs=rngs)
 
@@ -110,14 +110,13 @@ class ARPredictor(nnx.Module):
         self,
         emb: jax.Array,
         act_emb: jax.Array,
-        use_running_average: bool | None = None,
     ) -> jax.Array:
         x = emb + self.pos_embed[...]  # (B, T, embed_dim)
 
         for layer in self.layers:
             x = layer(x, act_emb, mask=self.causal_mask)
 
-        x = self.head_norm(x, use_running_average=use_running_average)
+        x = self.head_norm(x)
         x = self.head(x)
         return x
 

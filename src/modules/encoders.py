@@ -142,6 +142,10 @@ class ViT(nnx.Module):
         # Take the [CLS] token of the frame.
         cls = x[:, 0]  # (B, embed_dim)
 
+        # LeJEPA-style BatchNorm: normalization always uses the current batch's
+        # statistics (no running average), so single-frame encodings are NOT
+        # well-defined -- callers must encode frames in a batch (the planner
+        # encodes the goal together with the rollout context frames).
         x = self.proj(cls)  # (B, embed_dim)
         return x
 

@@ -36,5 +36,6 @@ include = ["lewm*", "env*", "loss*", "models*", "planner*", "train*", "src*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]

@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
@@ -8,246 +10,200 @@ except ImportError:  # running as a plain script: python src/jepa.py
     from modules import ARPredictor, Embedder, SIGReg, ViT
 
 
-class JEPA(nnx.Module):
-    """End-to-end JEPA from pixels: ViT encoder + action embedder + AR predictor."""
+@dataclass
+class ModelConfig:
+    """Every size :class:`JEPA` needs: the whole architecture in one object.
 
-    def __init__(
-        self,
-        rngs: nnx.Rngs,
-        embed_dim: int = 192,
-        img_size: int = 64,
-        in_channels: int = 3,
-        patch_size: int = 16,
-        enc_layers: int = 4,
-        enc_heads: int = 16,
-        action_dim: int = 2,
-        history_size: int = 3,
-        pred_depth: int = 6,
-        pred_heads: int = 16,
-        pred_mlp_dim: int = 2048,
-        sigreg_weight: float = 0.1,
-    ):
-        self.embed_dim = embed_dim
-        self.history_size = history_size
-        self.sigreg_weight = sigreg_weight
+    Single source of truth for the model. ``nnx`` keeps a plain dataclass out of
+    the checkpoint state, so this rides alongside the weights as JSON in
+    ``run_config.json`` and a later ``solve`` rebuilds the exact same shapes
+    from it.
+    """
+
+    # Pixels -> latents: per-frame ViT.
+    img_size: int = 64
+    in_channels: int = 3
+    patch_size: int = 16
+    embed_dim: int = 192  # latent width, shared by every sub-module
+    enc_layers: int = 4
+    enc_heads: int = 16
+
+    # Actions + trajectory conditioning.
+    action_dim: int = 2
+    history_size: int = 3  # frames the predictor conditions on
+    action_mlp_scale: int = 4
+
+    # Latents -> next latent: causal AR predictor.
+    pred_depth: int = 6
+    pred_heads: int = 16
+    pred_mlp_dim: int = 2048
+
+    # Loss = mse + sigreg_weight * (SIGReg on encoder latents + on predictions).
+    sigreg_weight: float = 0.1
+    sigreg_knots: int = 17
+    sigreg_num_proj: int = 128
+    sigreg_t_max: float = 3.0
+    sigreg_seed: int = 0  # fixes SIGReg's random projection directions
+
+
+class JEPA(nnx.Module):
+    """End-to-end JEPA from pixels: ViT encoder + action embedder + AR predictor.
+
+    Args:
+        config: the architecture, see :class:`ModelConfig`.
+        rngs: parameter init, and SIGReg's fixed projection directions.
+    """
+
+    def __init__(self, config: ModelConfig, rngs: nnx.Rngs):
+        self.config = config
 
         # Pixels -> latent: per-frame ViT (includes BN + Linear target projector).
         self.encoder = ViT(
-            in_channels=in_channels,
-            patch_size=patch_size,
-            img_size=img_size,
-            embed_dim=embed_dim,
-            num_layers=enc_layers,
-            num_heads=enc_heads,
+            in_channels=config.in_channels,
+            patch_size=config.patch_size,
+            img_size=config.img_size,
+            embed_dim=config.embed_dim,
+            num_layers=config.enc_layers,
+            num_heads=config.enc_heads,
             rngs=rngs,
         )
 
         # Actions -> per-step conditioning embeddings for the predictor.
         self.action_encoder = Embedder(
-            input_dim=action_dim,
-            smoothed_dim=embed_dim,
-            emb_dim=embed_dim,
-            mlp_scale=4,
+            input_dim=config.action_dim,
+            smoothed_dim=config.embed_dim,
+            emb_dim=config.embed_dim,
+            mlp_scale=config.action_mlp_scale,
             rngs=rngs,
         )
 
         # Latent -> latent: causal transformer with AdaLN-zero action conditioning.
         self.predictor = ARPredictor(
-            embed_dim=embed_dim,
-            num_frames=history_size,
-            depth=pred_depth,
-            num_heads=pred_heads,
-            mlp_dim=pred_mlp_dim,
+            embed_dim=config.embed_dim,
+            num_frames=config.history_size,
+            depth=config.pred_depth,
+            num_heads=config.pred_heads,
+            mlp_dim=config.pred_mlp_dim,
             rngs=rngs,
         )
 
+        # The Gaussianity regularizer is part of the model: it owns fixed random
+        # projection directions, so `loss` needs no extra argument and the
+        # directions ride along in the checkpoint.
+        self.sigreg = SIGReg(
+            knots=config.sigreg_knots,
+            num_proj=config.sigreg_num_proj,
+            embed_dim=config.embed_dim,
+            t_max=config.sigreg_t_max,
+            seed=config.sigreg_seed,
+        )
+
     def encode(self, pixels: jax.Array) -> jax.Array:
-        """Encode pixels to latents.
-
-        Args:
-            pixels: (B, T, H, W, C) or (B, H, W, C).
-        Returns:
-            (B, T, D) or (B, 1, D), where D = embed_dim.
-        """
-        if pixels.ndim == 3:
-            pixels = pixels[None, None]  # (1, 1, H, W, C)
-        elif pixels.ndim == 4:
-            pixels = pixels[:, None]  # (B, 1, H, W, C)
-
+        """Encode a batch of frame sequences: (B, T, H, W, C) -> (B, T, embed_dim)."""
         B, T, H, W, C = pixels.shape
         emb = self.encoder(pixels.reshape(B * T, H, W, C))  # (B*T, D)
         return emb.reshape(B, T, -1)  # (B, T, D)
 
-    def encode_actions(self, actions: jax.Array) -> jax.Array:
-        """Encode an action sequence.
-
-        Args:
-            actions: (B, T, action_dim).
-        Returns:
-            (B, T, D) action embeddings.
-        """
-        return self.action_encoder(actions)
-
-    def predict(
-        self,
-        embeddings: jax.Array,
-        action_embeddings: jax.Array,
-        use_running_average: bool | None = None,
-    ) -> jax.Array:
-        """Predict future latents from context.
-
-        Args:
-            embeddings: (B, H, D) context latents.
-            action_embeddings: (B, H, D) action embeddings, one per context step.
-            use_running_average: pass True for rollout/inference so the head
-                BatchNorm uses running stats instead of batch stats.
-        Returns:
-            (B, H, D) predicted latents; output at step t targets latent t + 1.
-        """
-        return self.predictor(
-            embeddings,
-            action_embeddings,
-            use_running_average=use_running_average,
-        )
-
-    def criterion(self, z_pred: jax.Array, z_target: jax.Array) -> jax.Array:
-        """MSE between the predicted next latent and the target next latent."""
-        return jnp.mean((z_pred - z_target) ** 2)
-
-    def loss(
-        self,
-        pixels: jax.Array,
-        actions: jax.Array,
-        sigreg_fn: SIGReg | None = None,
-    ) -> dict:
-        """Training loss: MSE(z_{t+1}, z_pred_{t+1}) + SIGReg regularizer.
+    def loss(self, pixels: jax.Array, actions: jax.Array) -> dict:
+        """Training loss: MSE(z_H, z_pred_H) + SIGReg regularizers.
 
         Args:
             pixels: (B, H + 1, H, W, C) history frames plus the target frame.
             actions: (B, H + 1, action_dim) aligned with pixels in time.
-            sigreg_fn: SIGReg module matching embed_dim; built from defaults
-                when omitted.
         Returns:
-            dict with keys: loss, mse, sigreg.
+            dict with keys: loss, mse, sigreg, sigreg_pred.
         """
-        H = self.history_size
+        H = self.config.history_size
 
-        if sigreg_fn is None:
-            sigreg_fn = SIGReg(embed_dim=self.embed_dim)
+        emb = self.encode(pixels)  # (B, H + 1, D)
+        act_emb = self.action_encoder(actions)  # (B, H + 1, D)
 
-        # Encode all frames: (B, T, D).
-        emb = self.encode(pixels)
-        act_emb = self.encode_actions(actions)  # (B, T, D)
+        # Teacher forcing: the causal predictor reads the H-step trajectory and
+        # predicts z_H. Only the last position carries a target.
+        pred = self.predictor(emb[:, :H], act_emb[:, :H])  # (B, H, D)
+        mse = jnp.mean((pred[:, -1] - emb[:, H]) ** 2)
 
-        # Teacher forcing: predict z_{H} (the next latent) from the H-step context.
-        pred = self.predict(emb[:, :H], act_emb[:, :H])  # (B, H, D)
-        z_pred = pred[:, -1]  # (B, D) -> z_pred_{t+1}
-        z_target = emb[:, H]  # (B, D) -> z_{t+1}
-
-        mse = self.criterion(z_pred, z_target)
-
-        # SIGReg anti-collapse loss over the encoder latents, (T, B, D).
-        sigreg = sigreg_fn(jnp.transpose(emb, (1, 0, 2)))
+        # SIGReg over the encoder latents, (T, B, D)...
+        sigreg = self.sigreg(jnp.transpose(emb, (1, 0, 2)))
+        sigreg_pred = self.sigreg(jnp.transpose(pred, (1, 0, 2)))
 
         return {
-            "loss": mse + self.sigreg_weight * sigreg,
+            "loss": mse + self.config.sigreg_weight * (sigreg + sigreg_pred),
             "mse": mse,
             "sigreg": sigreg,
+            "sigreg_pred": sigreg_pred,
         }
-
-    def cost(
-        self,
-        init_embeddings: jax.Array,
-        action: jax.Array,
-        goal_embedding: jax.Array,
-    ) -> jax.Array:
-        """Cost of an action: how far it takes the next latent from a goal.
-
-        Used for planning (e.g. CEM). The candidate action conditions the last
-        context step; earlier steps get zero conditioning.
-
-        Args:
-            init_embeddings: (B, H, D) encoded context latents.
-            action: (B, action_dim) candidate action.
-            goal_embedding: (B, D) target latent for z_{t+1}.
-        Returns:
-            scalar MSE between the predicted next latent and the goal.
-        """
-        B, H, D = init_embeddings.shape
-
-        act_emb = self.encode_actions(action[:, None, :])  # (B, 1, D)
-        act_emb = jnp.zeros((B, H, D)).at[:, -1].set(act_emb[:, 0])
-
-        z_pred = self.predict(init_embeddings, act_emb, use_running_average=True)[
-            :, -1
-        ]  # (B, D)
-
-        return self.criterion(z_pred, goal_embedding)
 
     def rollout(
         self,
         init_pixels: jax.Array,
         action_sequence: jax.Array,
-    ) -> jax.Array:
-        """Autoregressive rollout in latent space.
+        goal_pixels: jax.Array,
+        history_actions: jax.Array | None = None,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Roll the predictor forward over an action sequence.
 
         Args:
-            init_pixels: (B, H, H, W, C) or (B, H, W, C) history frames.
-            action_sequence: (B, T_rollout, action_dim) future actions.
+            init_pixels: (B, history_size, H, W, C) trajectory frames.
+            action_sequence: (B, T, action_dim) actions to roll out.
+            goal_pixels: (H, W, C) frame shared across the batch, or one
+                (B, H, W, C) goal per batch element. Encoded alongside the
+                trajectory so it lands in the same BatchNorm batch.
+            history_actions: (B, history_size - 1, action_dim) actions that
+                produced the trajectory frames; zeros when unknown.
         Returns:
-            (B, T_rollout, D) predicted latents.
+            (B, T, embed_dim) predicted latents, and the goal embedding --
+            (embed_dim,) for a shared goal, (B, embed_dim) for per-batch goals.
+            The planner scores candidates against it as the CEM cost target.
         """
-        if init_pixels.ndim == 4:
-            init_pixels = init_pixels[:, None]
+        H = self.config.history_size
+        if init_pixels.shape[1] != H:
+            raise ValueError(
+                f"expected {H} trajectory frames, got {init_pixels.shape[1]}"
+            )
 
-        ctx = self.encode(init_pixels)  # (B, H, D)
-        act_emb = self.encode_actions(action_sequence)  # (B, T, D)
+        # (H, W, C) -> (1, H, W, C); (G, H, W, C) stays (G, H, W, C), then the
+        # goal is broadcast over the batch and appended as one more time step.
+        goal = goal_pixels[None] if goal_pixels.ndim == 3 else goal_pixels
+        shared_goal = goal.shape[0] == 1
+        B, _, height, width, channels = init_pixels.shape
+        goal = jnp.broadcast_to(goal[:, None], (B, 1, height, width, channels))
+        frames = jnp.concatenate([init_pixels, goal], axis=1)  # (B, H+1, ...)
+        encoded = self.encode(frames)  # (B, H + 1, D)
+        trajectory = encoded[:, :H]
+        goal_embedding = encoded[0, H] if shared_goal else encoded[:, H]
 
-        B, H, D = ctx.shape
-        T = action_sequence.shape[1]
+        if history_actions is None:
+            history_actions = jnp.zeros(
+                (init_pixels.shape[0], H - 1, action_sequence.shape[-1]),
+                dtype=action_sequence.dtype,
+            )
+        act_emb = self.action_encoder(
+            jnp.concatenate([history_actions, action_sequence], axis=1)
+        )
 
-        preds = []
-        for t in range(T):
-            # Keep the last H latents as context, with the corresponding actions.
-            ctx_emb = ctx[:, -H:]
-            ctx_act = act_emb[:, t : t + H]
-            if ctx_act.shape[1] < H:
-                # Pad the action window with zeros when it runs past the end.
-                pad = jnp.zeros((B, H - ctx_act.shape[1], D))
-                ctx_act = jnp.concatenate([ctx_act, pad], axis=1)
-
-            # Predict the next latent; fix BN stats for inference.
-            next_emb = self.predict(ctx_emb, ctx_act, use_running_average=True)[
+        predictions = []
+        for step in range(action_sequence.shape[1]):
+            next_latent = self.predictor(trajectory, act_emb[:, step : step + H])[
                 :, -1:
-            ]  # (B, 1, D)
-            preds.append(next_emb)
-            ctx = jnp.concatenate([ctx, next_emb], axis=1)
+            ]
+            predictions.append(next_latent)
+            trajectory = jnp.concatenate([trajectory, next_latent], axis=1)[:, -H:]
 
-        return jnp.concatenate(preds, axis=1)  # (B, T, D)
+        return jnp.concatenate(predictions, axis=1), goal_embedding
 
 
 if __name__ == "__main__":
     rngs = nnx.Rngs(0)
-    model = JEPA(
-        rngs,
-        img_size=64,
-        action_dim=2,
-        history_size=3,
-    )
+    model = JEPA(ModelConfig(), rngs)
 
     pixels = jax.random.uniform(rngs.params(), (4, 4, 64, 64, 3))
     actions = jax.random.normal(rngs.params(), (4, 4, 2))
 
-    emb = model.encode(pixels)
-    print(f"encode:        {emb.shape}")
+    print(f"encode:        {model.encode(pixels).shape}")
+    losses = {k: float(v) for k, v in model.loss(pixels, actions).items()}
+    print(f"loss:          {losses}")
 
-    losses = model.loss(pixels, actions)
-    print(f"loss:          { {k: float(v) for k, v in losses.items()} }")
-
-    goal_emb = emb[:, -1]
-    sample_action = actions[:, -1:]
-    cost = model.cost(emb[:, :3], sample_action[:, 0], goal_emb)
-    print(f"action cost:   {float(cost):.4f}")
-
-    preds = model.rollout(pixels[:, :3], actions[:, 3:])
-    print(f"rollout:       {preds.shape}")
+    # One goal frame shared by the batch, exactly as the CEM planner passes it.
+    preds, goal_embedding = model.rollout(pixels[:, :3], actions[:, 3:], pixels[0, -1])
+    print(f"rollout:       {preds.shape}  goal: {goal_embedding.shape}")

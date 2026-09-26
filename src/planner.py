@@ -1,138 +1,156 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
 import jax
 import jax.numpy as jnp
-import numpy as np
-
-from jepa import JEPA
+from flax import nnx
 
 
-def encode_goal(model: JEPA, frame: jax.Array) -> jax.Array:
-    """(H, W, C) frame -> (D,) goal embedding."""
-    return model.encode(jnp.asarray(frame)[None])[0, -1]
+@dataclass(frozen=True)
+class CEMPlanner:
+    """Cross-entropy planner over the single :meth:`JEPA.rollout` interface.
 
+    The whole CEM loop is jitted: ``num_iterations`` rounds of
+    sample -> rollout -> elite update compile into a single graph, so replanning
+    at every environment step pays dispatch, not tracing.
 
-def plan_cem(
-    model: JEPA,
-    history: jax.Array,
-    goal_pixels=None,
-    goal_emb=None,
-    horizon: int = 8,
-    action_dim: int = 2,
-    num_samples: int = 128,
-    num_elites: int = 10,
-    num_iterations: int = 5,
-    action_min: float = -1.0,
-    action_max: float = 1.0,
-    seed: int = 0,
-):
-    """Best (horizon, action_dim) action sequence to reach the goal."""
-    goal_emb = goal_emb if goal_emb is not None else encode_goal(model, goal_pixels)
-    ctx = jnp.asarray(history)[None]  # (1, H, H, W, C)
+    The model is *traced*, not closed over. ``nnx.BatchNorm`` updates its running
+    statistics in place on every call, and flax rejects such a mutation across
+    trace levels, so the state is passed in as an argument and merged inside the
+    trace: the rollout works on a throwaway copy and the update is discarded.
+    That is harmless because ``use_running_average=False`` means the
+    normalization always uses the current batch's statistics anyway -- which is
+    also why a single-frame encoding is ill-defined, and why predictions and the
+    goal embedding have to come out of one rollout call.
+    """
 
-    lo, hi = jnp.asarray(action_min), jnp.asarray(action_max)
-    center = 0.5 * (lo + hi)
-    half = 0.5 * (hi - lo)
-    # Initialise at the CENTRE of the action range, std covering half the
-    # range: a zero-mean init clips every sample into one corner for
-    # asymmetric spaces like PushT's [0, 512].
-    mean = jnp.full((horizon, action_dim), center)
-    std = jnp.full((horizon, action_dim), half)
-    key = jax.random.key(seed)
+    model: nnx.Module = field(repr=False)
+    horizon: int = 8
+    action_dim: int = 2
+    num_samples: int = 128
+    topk: int = 10
+    num_iterations: int = 5
+    action_min: float = -1.0
+    action_max: float = 1.0
 
-    for _ in range(num_iterations):
-        key, sub = jax.random.split(key)
-        actions = jnp.clip(
-            mean + std * jax.random.normal(sub, (num_samples, horizon, action_dim)),
-            lo,
-            hi,
+    def __post_init__(self) -> None:
+        if self.horizon < 1 or self.action_dim < 1:
+            raise ValueError("horizon and action_dim must be positive")
+        if self.num_samples < 1:
+            raise ValueError("num_samples must be positive")
+        if not 1 <= self.topk <= self.num_samples:
+            raise ValueError("topk must be between 1 and num_samples")
+        if self.num_iterations < 1:
+            raise ValueError("num_iterations must be positive")
+        if self.action_min >= self.action_max:
+            raise ValueError("action_min must be smaller than action_max")
+
+        # Frozen dataclass, so stash the compiled entry point and the state it
+        # is called with. The graphdef closes over the call (static structure);
+        # only the leaves travel as an argument, exactly like the train step.
+        graphdef, params = nnx.split(self.model)
+
+        def search(
+            params, history, goal_pixels, key, init_mean, init_std, hist_actions
+        ):
+            model = nnx.merge(graphdef, params)
+            lower = jnp.asarray(self.action_min)
+            upper = jnp.asarray(self.action_max)
+            midpoint = 0.5 * (lower + upper)
+            half_range = 0.5 * (upper - lower)
+
+            mean, std = self._initial_distribution(
+                midpoint, half_range, init_mean, init_std
+            )
+            trajectory_batch = jnp.repeat(history[None], self.num_samples, axis=0)
+            batched_history_actions = self._batch_history_actions(
+                history.shape[0], hist_actions
+            )
+
+            for _ in range(self.num_iterations):
+                key, sample_key = jax.random.split(key)
+                actions = self._sample(sample_key, mean, std, lower, upper)
+                costs = self._evaluate(
+                    model.rollout,
+                    trajectory_batch,
+                    actions,
+                    goal_pixels,
+                    batched_history_actions,
+                )
+                mean, std = self._update_distribution(actions, costs, half_range)
+
+            return mean
+
+        object.__setattr__(self, "_params", params)
+        object.__setattr__(self, "_search", jax.jit(search))
+
+    def plan(
+        self,
+        history: jax.Array,
+        goal_pixels: jax.Array,
+        *,
+        seed: int = 0,
+        init_mean=None,
+        init_std=None,
+        history_actions=None,
+    ) -> jax.Array:
+        """Best action sequence found, (horizon, action_dim); run its first step.
+
+        ``init_mean``/``init_std`` seed the CEM distribution (both ``None`` for
+        the default midpoint start).
+        """
+        return self._search(
+            self._params,
+            jnp.asarray(history),
+            jnp.asarray(goal_pixels),
+            jax.random.key(seed),
+            init_mean,
+            init_std,
+            history_actions,
         )
-        # Distance of each rollout's final latent to the goal embedding.
-        preds = model.rollout(
-            jnp.repeat(ctx, num_samples, axis=0), actions
-        )  # (N, T, D)
-        costs = jnp.mean((preds[:, -1] - goal_emb) ** 2, axis=-1)  # (N,)
-        elites = actions[jnp.argsort(costs)[:num_elites]]
-        mean = jnp.mean(elites, axis=0)
-        # Refit std to the elites, floored so the search doesn't collapse
-        # onto a constant action before it converges.
-        std = jnp.std(elites, axis=0) + 1e-3 * half
-    return mean
 
+    def _initial_distribution(self, midpoint, half_range, init_mean, init_std):
+        shape = (self.horizon, self.action_dim)
+        mean = (
+            jnp.asarray(init_mean, dtype=jnp.float32)
+            if init_mean is not None
+            else jnp.full(shape, midpoint)
+        )
+        std = (
+            jnp.asarray(init_std, dtype=jnp.float32)
+            if init_std is not None
+            else jnp.full(shape, half_range)
+        )
+        return mean, std
 
-def plan_mpc(
-    model: JEPA,
-    env,
-    init_pixels,
-    goal_pixels=None,
-    goal_emb=None,
-    n_steps: int = 100,
-    **cem,
-):
-    """Receding-horizon loop: plan, execute ONE action, observe, replan."""
-    goal_emb = goal_emb if goal_emb is not None else encode_goal(model, goal_pixels)
-    h = model.history_size
+    def _batch_history_actions(self, history_size, history_actions):
+        if history_actions is None:
+            actions = jnp.zeros((history_size - 1, self.action_dim), dtype=jnp.float32)
+        else:
+            actions = jnp.asarray(history_actions, dtype=jnp.float32)
+        if actions.ndim == 2:
+            actions = actions[None]
+        return jnp.repeat(actions, self.num_samples, axis=0)
 
-    frames = np.asarray(init_pixels)
-    if frames.ndim == 3:
-        frames = frames[None]
-    history = [jnp.asarray(f) for f in frames]
-    while len(history) < h:
-        history.append(history[-1])
-    history = history[-h:]
+    def _sample(self, key, mean, std, lower, upper):
+        noise = jax.random.normal(
+            key, (self.num_samples, self.horizon, self.action_dim)
+        )
+        return jnp.clip(mean + std * noise, lower, upper)
 
-    actions, obs, rewards = [], [], []
-    for _ in range(n_steps):
-        action = plan_cem(model, jnp.stack(history), goal_emb=goal_emb, **cem)[0]
-        frame, reward, terminated, truncated, _ = env.step(np.asarray(action))
-        actions.append(np.asarray(action))
-        obs.append(frame)
-        rewards.append(reward)
-        history.append(jnp.asarray(frame))
-        history = history[-h:]
-        if terminated or truncated:
-            break
-    return np.array(actions), np.array(obs), np.array(rewards)
+    def _evaluate(
+        self, rollout, trajectory_batch, actions, goal_pixels, history_actions
+    ):
+        # Both outputs come from one rollout call, so predictions and the goal
+        # embedding share the same BatchNorm batch.
+        predictions, goal_embedding = rollout(
+            trajectory_batch, actions, goal_pixels, history_actions
+        )
+        return jnp.mean((predictions[:, -1] - goal_embedding) ** 2, axis=-1)
 
-
-def _dot(pos: np.ndarray) -> np.ndarray:
-    """Render a 64x64 float frame with a dot at ``pos``."""
-    img = np.zeros((64, 64, 3), dtype=np.float32)
-    y, x = (64 * np.asarray(pos)).astype(int)
-    img[max(y - 1, 0) : y + 2, max(x - 1, 0) : x + 2] = 0.5
-    return img
-
-
-class _DotChaser:
-    """Synthetic env: actions nudge a dot; observations are 64x64 frames."""
-
-    def __init__(self):
-        self.pos = np.array([0.3, 0.3])
-
-    def step(self, action):
-        self.pos = np.clip(self.pos + 0.1 * np.asarray(action), 0.0, 1.0)
-        done = bool(np.all(self.pos > 0.95))
-        return _dot(self.pos), 0.0, done, False, {}
-
-
-if __name__ == "__main__":
-    from flax import nnx
-
-    model = JEPA(nnx.Rngs(0), img_size=64, action_dim=2, history_size=3)
-    cem = dict(
-        horizon=3, action_dim=2, num_samples=16, num_elites=4, num_iterations=3, seed=7
-    )
-
-    k1, k2 = jax.random.split(jax.random.key(1))
-    history = jax.random.uniform(k1, (3, 64, 64, 3))
-    goal = jax.random.uniform(k2, (64, 64, 3))
-    seq = plan_cem(model, history, goal, **cem)
-    print(f"CEM plan:  {seq.shape}  (expect (3, 2))")
-
-    actions, obs, rewards = plan_mpc(
-        model, _DotChaser(), _dot([0.2, 0.2]), _dot([0.8, 0.8]), n_steps=5, **cem
-    )
-    print(f"MPC:       {actions.shape} {obs.shape} {rewards.shape}")
-
-    assert seq.shape == (3, 2)
-    assert actions.ndim == 2 and actions.shape[1] == 2
-    assert len(obs) == len(actions) == len(rewards)
-    print("\nsmoke test OK ✓")
+    def _update_distribution(self, actions, costs, half_range):
+        topk = actions[jnp.argsort(costs)[: self.topk]]
+        mean = jnp.mean(topk, axis=0)
+        std = jnp.std(topk, axis=0) + 1e-3 * half_range
+        return mean, std

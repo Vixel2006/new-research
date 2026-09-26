@@ -44,7 +44,11 @@ class SIGReg(nnx.Module):
 
         # Standardize across the sample axis (zero mean, unit variance).
         z = z - z.mean(axis=0, keepdims=True)
-        z = z / jnp.maximum(z.std(axis=0, keepdims=True), 1e-8)
+        z = z / jnp.maximum(z.std(axis=0, keepdims=True), 1e-6)
+        # Clip before the characteristic-function evaluation: on near-degenerate
+        # batches the standardization can produce extreme tails whose cos/sin
+        # numerics destabilise training. Real training data stays well inside.
+        z = jnp.clip(z, -8.0, 8.0)
 
         # 1D projections: (N, num_proj).
         p = z @ self.directions.T

@@ -1,96 +1,18 @@
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import optax
 from flax import nnx
-from orbax import checkpoint as orbax
 
 try:
-    from .jepa import JEPA
-    from .modules import SIGReg
-except ImportError:
-    from jepa import JEPA
-    from modules import SIGReg
-
-
-def create_lr_schedule(
-    peak_lr: float,
-    warmup_steps: int,
-    decay_steps: int,
-    end_lr: float = 0.0,
-) -> optax.Schedule:
-    """Linear warmup up to ``peak_lr``, then cosine decay to ``end_lr``."""
-    return optax.warmup_cosine_decay_schedule(
-        init_value=0.0,
-        peak_value=peak_lr,
-        warmup_steps=warmup_steps,
-        decay_steps=decay_steps,
-        end_value=end_lr,
-    )
-
-
-def create_optimizer(
-    peak_lr: float = 3e-4,
-    warmup_steps: int = 1_000,
-    decay_steps: int = 100_000,
-    end_lr: float = 0.0,
-    weight_decay: float = 0.05,
-    b1: float = 0.9,
-    b2: float = 0.999,
-    eps: float = 1e-8,
-    grad_clip: float | None = 1.0,
-) -> optax.GradientTransformation:
-    """AdamW with warmup + cosine LR schedule, plus global-norm grad clipping."""
-    schedule = create_lr_schedule(peak_lr, warmup_steps, decay_steps, end_lr)
-
-    tx = optax.adamw(
-        learning_rate=schedule,
-        weight_decay=weight_decay,
-        b1=b1,
-        b2=b2,
-        eps=eps,
-    )
-    if grad_clip is not None and grad_clip > 0:
-        tx = optax.chain(optax.clip_by_global_norm(grad_clip), tx)
-    return tx
-
-
-@dataclass
-class MetricHistory:
-    """Ring-buffer of per-step training metrics.
-
-    Stores every logged step; use :meth:`mean` / :meth:`last` / :meth:`sma`
-    to summarise the run. Small enough to keep the whole run in memory.
-    """
-
-    steps: list[int] = field(default_factory=list)
-    metrics: list[dict] = field(default_factory=list)
-
-    def record(self, step: int, metrics: dict) -> None:
-        self.steps.append(step)
-        self.metrics.append(dict(metrics))
-
-    def last(self) -> dict:
-        """Most recently recorded metrics (or an empty dict)."""
-        return self.metrics[-1] if self.metrics else {}
-
-    def mean(self, key: str, since: int = 0) -> float:
-        """Mean of ``key`` over all recorded steps >= ``since``."""
-        vals = [
-            m[key] for m, s in zip(self.metrics, self.steps) if s >= since and key in m
-        ]
-        return sum(vals) / len(vals) if vals else float("nan")
-
-    def sma(self, key: str, window: int = 100) -> float:
-        """Simple moving average of ``key`` over the last ``window`` steps."""
-        vals = [m[key] for m in self.metrics[-window:] if key in m]
-        return sum(vals) / len(vals) if vals else float("nan")
-
-    def lr(self) -> float:
-        """Current learning rate (the last recorded one)."""
-        m = self.last()
-        return m.get("lr", float("nan"))
+    from .jepa import JEPA, ModelConfig
+    from .utils import checkpoint
+except ImportError:  # running as a plain script: python src/train.py
+    from jepa import JEPA, ModelConfig
+    from utils import checkpoint
 
 
 @dataclass
@@ -102,75 +24,87 @@ class TrainConfig:
     decay_steps: int = 100_000
     end_lr: float = 0.0
     weight_decay: float = 0.05
-    b1: float = 0.9
-    b2: float = 0.999
-    eps: float = 1e-8
-    grad_clip: float | None = 1.0
+    grad_clip: float = 1.0
+
+    def schedule(self) -> optax.Schedule:
+        """Linear warmup up to ``peak_lr``, then cosine decay to ``end_lr``."""
+        return optax.warmup_cosine_decay_schedule(
+            init_value=0.0,
+            peak_value=self.peak_lr,
+            warmup_steps=self.warmup_steps,
+            decay_steps=self.decay_steps,
+            end_value=self.end_lr,
+        )
+
+    def optimizer(self, schedule: optax.Schedule) -> optax.GradientTransformation:
+        """AdamW on ``schedule``, with global-norm gradient clipping."""
+        tx = optax.adamw(learning_rate=schedule, weight_decay=self.weight_decay)
+        if self.grad_clip:
+            tx = optax.chain(optax.clip_by_global_norm(self.grad_clip), tx)
+        return tx
+
+
+def _log_line(step: int, metrics: dict) -> str:
+    """One console line for a logged step, whatever terms ``loss`` returned."""
+    terms = "  ".join(
+        f"{k} {v:.4g}" for k, v in metrics.items() if k not in ("step", "lr")
+    )
+    return f"[{step:7d}]  {terms}"
 
 
 class Trainer:
-    """JEPA trainer: jitted AdamW step, metric tracking, orbax checkpointing."""
+    """JEPA trainer: jitted AdamW step, metrics logging, best-on-val checkpointing.
 
-    def __init__(
-        self,
-        model: JEPA,
-        sigreg_fn: SIGReg,
-        config: "TrainConfig",
-        optimizer: optax.GradientTransformation | None = None,
-    ):
+    The *only* checkpoint the trainer writes is the one that beats the best
+    validation loss so far -- weights on disk go through
+    :mod:`src.utils.checkpoint` (``best.json`` records the winning tag).
+    """
+
+    def __init__(self, model: JEPA, config: TrainConfig):
         self.model = model
-        self.sigreg_fn = sigreg_fn
         self.config = config
-        self.tx = optimizer or create_optimizer(
-            peak_lr=config.peak_lr,
-            warmup_steps=config.warmup_steps,
-            decay_steps=config.decay_steps,
-            end_lr=config.end_lr,
-            weight_decay=config.weight_decay,
-            b1=config.b1,
-            b2=config.b2,
-            eps=config.eps,
-            grad_clip=config.grad_clip,
-        )
+        self.schedule = config.schedule()
 
         # NNX optimizer wraps the model (Params target by default), so its
         # state rides along inside the jitted step with no extra plumbing.
-        self.optimizer = nnx.Optimizer(model, self.tx, wrt=nnx.Param)
+        self.optimizer = nnx.Optimizer(
+            model, config.optimizer(self.schedule), wrt=nnx.Param
+        )
 
-        self.history = MetricHistory()
-        self._step = 0
+        self.history: list[dict] = []  # one dict per logged step, `step` included
+        self.step = 0
+        self.best_val = float("inf")  # lowest val_loss seen so far
+        self.best_step = 0
+        self.best_tag: str | None = None
+
+        # The module graph never changes, so define it once here; only the
+        # State crosses the jit boundary, and a step never retraces.
+        self._graphdef, _ = nnx.split((self.model, self.optimizer))
         self._train_step = self._build_train_step()
 
     def _build_train_step(self):
-        """Split out graph + state once, then jit a pure function state -> state.
-
-        Returns a callable ``step(state, pixels, actions) -> (state, metrics)``
-        where ``state`` is the merged NNX State of (model, optimizer).
-        """
-        graphdef, state = nnx.split((self.model, self.optimizer))
-
         def _loss(model, pixels, actions):
-            losses = model.loss(pixels, actions, self.sigreg_fn)
-            return losses["loss"], losses  # scalar (loss) + aux (metrics dict)
+            losses = model.loss(pixels, actions)
+            return losses["loss"], losses  # differentiated + aux (metrics)
 
         @jax.jit
         def step(state, pixels, actions):
-            model, optimizer = nnx.merge(graphdef, state)
-
-            (loss, losses), grads = nnx.value_and_grad(_loss, has_aux=True)(
+            model, optimizer = nnx.merge(self._graphdef, state)
+            (_, losses), grads = nnx.value_and_grad(_loss, has_aux=True)(
                 model, pixels, actions
             )
 
+            # NaN/inf guard: one bad mini-batch (e.g. a SIGReg overflow on a
+            # near-degenerate batch of frames) must not poison the weights.
+            # Zero such gradients; the optimizer then leaves params unchanged
+            # (moments just decay) and training continues on the next batch.
+            finite = jnp.isfinite(losses["loss"])
+            grads = jax.tree.map(
+                lambda g: jnp.where(finite, g, jnp.zeros_like(g)), grads
+            )
+
             optimizer.update(model, grads)
-
-            metrics = {
-                "loss": loss,
-                "mse": losses["mse"],
-                "sigreg": losses["sigreg"],
-            }
-
-            state = nnx.split((model, optimizer))[1]
-            return state, metrics
+            return nnx.split((model, optimizer))[1], losses
 
         return step
 
@@ -180,132 +114,128 @@ class Trainer:
         *,
         num_iters: int | None = None,
         log_interval: int = 100,
-        ckpt_interval: int = 1_000,
+        eval_interval: int = 100,
+        val_batches=(),
         ckpt_dir: str | Path = "checkpoints",
         log_fn=None,
-        verbose: bool = True,
-    ) -> MetricHistory:
+    ) -> list[dict]:
+        """Run ``num_iters`` steps, logging every ``log_interval`` and validating
+        every ``eval_interval``; each new best ``val_loss`` is checkpointed.
+        """
         num_iters = num_iters or self.config.decay_steps
         ckpt_dir = Path(ckpt_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
+        val_batches = list(val_batches)
+        if not val_batches or eval_interval < 1:
+            print("warning: no validation pool, so no checkpoint will be written")
 
-        schedule = create_lr_schedule(
-            self.config.peak_lr,
-            self.config.warmup_steps,
-            self.config.decay_steps,
-            self.config.end_lr,
-        )
+        batches = iter(train_iter)
+        final = self.step + num_iters
 
-        train_iter = iter(train_iter)
-        start = self._step
-
-        for t in range(start, start + num_iters):
-            batch = next(train_iter)
-            pixels = batch["pixels"] if isinstance(batch, dict) else batch[0]
-            actions = batch["actions"] if isinstance(batch, dict) else batch[1]
-
-            # Split inside the loop so each jit call starts from the latest
-            # merged state (models/optimizers are small; only arrays are traced).
-            graphdef, state = nnx.split((self.model, self.optimizer))
-            state, metrics = self._train_step(state, pixels, actions)
+        for t in range(self.step, final):
+            batch = next(batches)
+            state, losses = self._train_step(
+                nnx.state((self.model, self.optimizer)),
+                batch["pixels"],
+                batch["actions"],
+            )
             nnx.update((self.model, self.optimizer), state)
+            self.step = step = t + 1
 
-            # Restore self._step from the recorded step (avoids drift).
-            self._step = t + 1
-            lr = float(schedule(t))
-            metrics = {"step": self._step, "lr": lr, **metrics}
+            metrics = {"step": step, "lr": float(self.schedule(t)), **losses}
+            improved = False
+            validate = bool(val_batches) and (
+                step % eval_interval == 0 or step == final
+            )
+            if validate:
+                metrics.update(self._validate(val_batches))
+                improved = self._save_if_best(ckpt_dir, metrics["val_loss"])
 
-            if self._step % log_interval == 0 or self._step == start + num_iters:
-                self.history.record(self._step, dict(metrics))
-                if verbose:
-                    print(
-                        f"[{self._step:7d}] "
-                        f"loss {float(metrics['loss']):.4f} "
-                        f"mse {float(metrics['mse']):.4f} "
-                        f"sigreg {float(metrics['sigreg']):.4f} "
-                        f"lr {lr:.2e}"
-                    )
+            if step % log_interval == 0 or validate:
+                self.history.append(metrics)
+                print(_log_line(step, metrics) + ("  <- best" if improved else ""))
                 if log_fn is not None:
-                    log_fn(self._step, metrics)
-
-            if ckpt_interval and self._step % ckpt_interval == 0:
-                self.save_checkpoint(ckpt_dir, tag=str(self._step))
+                    log_fn(step, metrics)
 
         return self.history
 
-    def save_checkpoint(self, ckpt_dir: str | Path, tag: str = "latest") -> Path:
-        path = Path(ckpt_dir) / tag
-        ckptr = orbax.PyTreeCheckpointer()
-        ckptr.save(
-            path,
-            nnx.state((self.model, self.optimizer), self.sigreg_fn),
-            force=True,
-        )
-        return path
+    def _validate(self, val_batches: list) -> dict:
+        """Mean of every loss term over the fixed pool (not jitted)."""
+        totals: dict[str, float] = {}
+        for batch in val_batches:
+            losses = self.model.loss(batch["pixels"], batch["actions"])
+            for k, v in losses.items():
+                totals[k] = totals.get(k, 0.0) + float(v)
+        return {f"val_{k}": v / len(val_batches) for k, v in totals.items()}
 
-    @classmethod
-    def load_checkpoint(cls, model: JEPA, sigreg_fn: SIGReg | None = None):
-        raise NotImplementedError(
-            "load_checkpoint is not implemented yet; pass a pre-built model "
-            "and SIGReg into Trainer to resume."
-        )
+    def _save_if_best(self, ckpt_dir: Path, val_loss) -> bool:
+        """Write ``best_<step>`` when this ``val_loss`` beats the best so far.
+
+        Tags carry the step, so reruns never collide, and a non-finite value
+        never counts as an improvement.
+        """
+        val_loss = float(val_loss)
+        if not math.isfinite(val_loss) or val_loss >= self.best_val:
+            return False
+        self.best_val, self.best_step = val_loss, self.step
+        self.best_tag = f"best_{self.step}"
+        checkpoint.save(self.model, ckpt_dir, tag=self.best_tag)
+        checkpoint.record_best(ckpt_dir, self.best_tag, self.best_step, self.best_val)
+        return True
 
 
 if __name__ == "__main__":
-    import jax.numpy as jnp
 
-    class FakeBatcher:
-        """Endless iterator of random (pixels, actions) batches.
+    def fake_batches(rngs, batch=4, frames=4):
+        """Endless random (pixels, actions) batches, as ``PushT.batches`` would."""
+        while True:
+            key = rngs()
+            yield {
+                "pixels": jax.random.uniform(
+                    key, (batch, frames, 64, 64, 3), minval=0.0, maxval=1.0
+                ),
+                "actions": jax.random.normal(
+                    jax.random.fold_in(key, 1), (batch, frames, 2)
+                ),
+            }
 
-        Each batch is a dict with "pixels" (B, T, H, W, C) and "actions"
-        (B, T, action_dim), matching what Trainer.train() unpacks.
-        """
-
-        def __init__(self, rngs: nnx.Rngs, dtype=jnp.float32):
-            self.rngs = rngs
-            self.dtype = dtype
-
-        def __iter__(self):
-            return self
-
-        def __next__(self):
-            key = self.rngs()
-            pixels = jax.random.uniform(
-                key, (4, 4, 64, 64, 3), minval=0.0, maxval=1.0, dtype=self.dtype
-            )
-            key2 = jax.random.fold_in(key, 1)
-            actions = jax.random.normal(key2, (4, 4, 2), dtype=self.dtype)
-            return {"pixels": pixels, "actions": actions}
-
-    rngs = nnx.Rngs(0)
-    model = JEPA(rngs, img_size=64, action_dim=2, history_size=3)
-    sigreg = SIGReg(embed_dim=model.embed_dim)
-
+    model_cfg = ModelConfig(
+        embed_dim=32, enc_layers=1, enc_heads=2, pred_depth=1, pred_heads=2,
+        pred_mlp_dim=64,  # tiny, so this smoke test stays fast on CPU
+    )
+    model = JEPA(model_cfg, nnx.Rngs(0))
     trainer = Trainer(
         model=model,
-        sigreg_fn=sigreg,
-        config=TrainConfig(
-            peak_lr=3e-4,
-            warmup_steps=10,
-            decay_steps=30,
-            end_lr=0.0,
-        ),
+        config=TrainConfig(peak_lr=3e-4, warmup_steps=10, decay_steps=30),
     )
 
-    batcher = FakeBatcher(nnx.Rngs(1))
-    history = trainer.train(
-        batcher,
+    batches = fake_batches(nnx.Rngs(1))
+    pool = [next(batches) for _ in range(2)]
+    trainer.train(
+        batches,
         num_iters=6,
-        log_interval=1,
-        verbose=True,
+        log_interval=3,
+        eval_interval=3,
+        val_batches=pool,
+        ckpt_dir="/tmp/opencode/train_ckpt",
     )
+    print(f"best: {trainer.best_tag} val_loss {trainer.best_val:.4f}")
 
-    print(
-        f"\nfinal loss:  {trainer.model.loss(batcher.__next__()['pixels'], batcher.__next__()['actions'])['loss']:.4f}"
-    )
+    fresh = next(batches)
+    final = model.loss(fresh["pixels"], fresh["actions"])["loss"]
+    print(f"final loss:  {final:.4f}")
 
     init = jax.random.uniform(jax.random.key(9), (2, 3, 64, 64, 3))
     acts = jax.random.normal(jax.random.key(8), (2, 2, 2))
-    preds = trainer.model.rollout(init, acts)
+    preds, _goal = model.rollout(init, acts, init[0, -1])
     print(f"rollout:     {preds.shape}")
-    print("\nsmoke test OK ✓")
+
+    checkpoint.save(model, "/tmp/opencode/train_ckpt", tag="latest")
+    reloaded = checkpoint.load(
+        JEPA(model_cfg, nnx.Rngs(0)),
+        ckpt_dir="/tmp/opencode/train_ckpt",
+        tag="latest",
+    )
+    assert jnp.allclose(
+        reloaded.loss(fresh["pixels"], fresh["actions"])["loss"], final
+    )
