@@ -1,1 +1,0 @@
-"""LeWorldModel source package."""

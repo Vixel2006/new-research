@@ -1,202 +1,187 @@
-import jax
-import jax.numpy as jnp
-from flax import nnx
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+
+from .sigreg import *
 
 
-class PatchEmbeddings(nnx.Module):
-    """Patchify and embed a single frame: (B, H, W, C) -> (B, N + 1, embed_dim)."""
-
-    def __init__(
-        self,
-        in_channels: int,
-        patch_size: int,
-        img_size: int,
-        embed_dim: int,
-        rngs: nnx.Rngs,
-    ):
-        assert img_size % patch_size == 0, "img_size must be divisible by patch_size"
-
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.embed_dim = embed_dim
-
-        # Patches per frame, plus one [CLS] token prepended to them.
-        self.num_patches = (img_size // patch_size) ** 2
-        self.tokens_per_frame = self.num_patches + 1
-
-        self.patch_embed = nnx.Linear(
-            patch_size * patch_size * in_channels,
-            embed_dim,
-            rngs=rngs,
+class FeedForward(nn.Module):
+    def __init__(self, dim, hidden_dim, dropout=0.9):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout),
         )
 
-        self.cls_token = nnx.Param(jnp.zeros((1, 1, embed_dim)))
+    def forward(self, x):
+        return self.net(x)
 
-        self.pos_embed = nnx.Param(
-            jax.random.normal(
-                rngs.params(),
-                (1, self.tokens_per_frame, embed_dim),
+
+class Attention(nn.Module):
+    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0):
+        super().__init__()
+        inner_dim = dim_head * heads
+        project_out = not (heads == 1 and dim_head == dim)
+
+        self.heads = heads
+        self.scale = dim_head**-0.5
+        self.dropout = dropout
+        self.norm = nn.LayerNorm(dim)
+        self.attend = nn.Softmax(dim=-1)
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
+        self.to_out = (
+            nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout))
+            if project_out
+            else nn.Identity()
+        )
+
+    def forward(self, x, causal=True):
+        x = self.norm(x)
+        drop = self.dropout if self.training else 0.0
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = (rearrange(t, "b t (h d) -> b h t d", h=self.heads) for t in qkv)
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=drop, is_causal=causal)
+        out = rearrange(out, "b h t d -> b t (h d)")
+        return self.to_out(out)
+
+
+class ConditionalBlock(nn.Module):
+    def __init__(self, dim, heads, dim_head, mlp_dim, dropout=0.0):
+        super().__init__()
+
+        self.attn = Attention(dim, heads=heads, dim_head=dim_head, dropout=dropout)
+        self.mlp = FeedForward(dim, mlp_dim, dropout=dropout)
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(), nn.Linear(dim, 6 * dim, bias=True)
+        )
+
+        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
+
+    def forward(self, x, c):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.adaLN_modulation(c).chunk(6, dim=-1)
+        )
+        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        return x
+
+
+class Block(nn.Module):
+    def __init__(self, dim, heads, dim_head, mlp_dim, dropout=0.0):
+        super().__init__()
+
+        self.attn = Attention(dim, heads=heads, dim_head=dim_head, dropout=dropout)
+        self.mlp = FeedForward(dim, mlp_dim, dropout=dropout)
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class Transformer(nn.Module):
+    def __init__(
+        self,
+        input_dim,
+        hidden_dim,
+        output_dim,
+        depth,
+        heads,
+        dim_head,
+        mlp_dim,
+        dropout=0.0,
+        block_class=Block,
+    ):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.layers = nn.ModuleList([])
+
+        self.input_proj = (
+            nn.Linear(input_dim, hidden_dim)
+            if input_dim != hidden_dim
+            else nn.Identity()
+        )
+
+        self.cond_proj = (
+            nn.Linear(input_dim, hidden_dim)
+            if input_dim != hidden_dim
+            else nn.Identity()
+        )
+
+        self.output_proj = (
+            nn.Linear(hidden_dim, output_dim)
+            if hidden_dim != output_dim
+            else nn.Identity()
+        )
+
+        for _ in range(depth):
+            self.layers.append(
+                block_class(hidden_dim, heads, dim_head, mlp_dim, dropout)
             )
-            * 0.02
-        )
 
-    def __call__(self, x: jax.Array) -> jax.Array:
-        B, H, W, C = x.shape
-        P = self.patch_size
+    def forward(self, x, c=None):
 
-        # (B, H, W, C) -> (B, H/P, P, W/P, P, C)
-        x = x.reshape(B, H // P, P, W // P, P, C)
-        x = x.transpose(0, 1, 3, 2, 4, 5)
+        if hasattr(self, "input_proj"):
+            x = self.input_proj(x)
 
-        x = x.reshape(
-            B,
-            self.num_patches,
-            P * P * C,
-        )
+        if c is not None and hasattr(self, "cond_proj"):
+            c = self.cond_proj(c)
 
-        x = self.patch_embed(x)  # (B, N, embed_dim)
+        for block in self.layers:
+            x = block(x) if isinstance(block, Block) else block(x, c)
+        x = self.norm(x)
 
-        # Prepend one [CLS] token.
-        cls = jnp.broadcast_to(
-            self.cls_token[...],
-            (B, 1, self.embed_dim),
-        )  # (B, 1, embed_dim)
-
-        x = jnp.concatenate([cls, x], axis=1)  # (B, N + 1, embed_dim)
-
-        x += self.pos_embed[...]
-
+        if hasattr(self, "output_proj"):
+            x = self.output_proj(x)
         return x
 
 
-class ViTLayer(nnx.Module):
-    """ViT block: spatial self-attention + MLP over a single frame's tokens."""
+class Embedder(nn.Module):
+    def __init__(self, input_dim=10, smoothed_dim=10, emb_dim=10, mlp_scale=4):
+        super().__init__()
+        self.patch_embed = nn.Conv1d(input_dim, smoothed_dim, kernel_size=1, stride=1)
+        self.embed = nn.Sequential(
+            nn.Linear(smoothed_dim, mlp_scale * emb_dim),
+            nn.SiLU(),
+            nn.Linear(mlp_scale * emb_dim, emb_dim),
+        )
 
+    def forward(self, x):
+        x = x.float()
+        x = x.permute(0, 2, 1)
+        x = self.patch_embed(x)
+        x = x.permute(0, 2, 1)
+        x = self.embed(x)
+        return x
+
+
+class MLP(nn.Module):
     def __init__(
         self,
-        embed_dim: int,
-        num_heads: int,
-        rngs: nnx.Rngs,
+        input_dim,
+        hidden_dim,
+        output_dim=None,
+        norm_fn=nn.LayerNorm,
+        act_fn=nn.GELU,
     ):
-        self.norm1 = nnx.LayerNorm(embed_dim, rngs=rngs)
-
-        self.mha = nnx.MultiHeadAttention(
-            num_heads,
-            in_features=embed_dim,
-            qkv_features=embed_dim,
-            out_features=embed_dim,
-            decode=False,
-            rngs=rngs,
+        super().__init__()
+        norm_fn = norm_fn(hidden_dim) if norm_fn is not None else nn.Identity()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            norm_fn,
+            act_fn(),
+            nn.Linear(hidden_dim, output_dim or input_dim),
         )
 
-        self.norm2 = nnx.LayerNorm(embed_dim, rngs=rngs)
-
-        self.mlp = nnx.Sequential(
-            nnx.Linear(embed_dim, embed_dim * 3, rngs=rngs),
-            nnx.gelu,
-            nnx.Linear(embed_dim * 3, embed_dim, rngs=rngs),
-        )
-
-    def __call__(self, x: jax.Array) -> jax.Array:
-        x += self.mha(self.norm1(x))
-        x += self.mlp(self.norm2(x))
-        return x
-
-
-class ViT(nnx.Module):
-    """Per-frame Vision Transformer encoder: (B, H, W, C) -> (B, embed_dim)."""
-
-    def __init__(
-        self,
-        in_channels: int,
-        patch_size: int,
-        img_size: int,
-        embed_dim: int,
-        num_layers: int,
-        num_heads: int,
-        rngs: nnx.Rngs,
-    ):
-        self.embed_dim = embed_dim
-
-        self.embedding = PatchEmbeddings(
-            in_channels, patch_size, img_size, embed_dim, rngs
-        )
-
-        self.layers = nnx.List(
-            [ViTLayer(embed_dim, num_heads, rngs) for _ in range(num_layers)]
-        )
-
-        # Project the [CLS] token into the latent space used by SIGReg and the
-        # predictor. Needed because the last ViT layer outputs LayerNorm-ed
-        # features, which would obstruct the anti-collapse objective.
-        self.proj = nnx.Sequential(
-            nnx.BatchNorm(embed_dim, rngs=rngs),
-            nnx.Linear(embed_dim, embed_dim, rngs=rngs),
-        )
-
-    def __call__(self, x: jax.Array) -> jax.Array:
-        x = self.embedding(x)  # (B, N + 1, embed_dim)
-        for layer in self.layers:
-            x = layer(x)
-
-        # Take the [CLS] token of the frame.
-        cls = x[:, 0]  # (B, embed_dim)
-
-        # LeJEPA-style BatchNorm: normalization always uses the current batch's
-        # statistics (no running average), so single-frame encodings are NOT
-        # well-defined -- callers must encode frames in a batch (the planner
-        # encodes the goal together with the rollout context frames).
-        x = self.proj(cls)  # (B, embed_dim)
-        return x
-
-
-class Embedder(nnx.Module):
-    """Action Encoder and embedder"""
-
-    def __init__(
-        self,
-        input_dim: int,
-        smoothed_dim: int,
-        emb_dim: int,
-        mlp_scale: int,
-        rngs: nnx.Rngs,
-    ):
-        self.patch_embed = nnx.Conv(
-            input_dim, smoothed_dim, kernel_size=1, strides=1, rngs=rngs
-        )
-        self.embed = nnx.Sequential(
-            nnx.Linear(smoothed_dim, mlp_scale * emb_dim, rngs=rngs),
-            nnx.selu,
-            nnx.Linear(mlp_scale * emb_dim, emb_dim, rngs=rngs),
-        )
-
-    def __call__(self, x: jax.Array) -> jax.Array:
-        x = self.patch_embed(x)  # (B, T, smoothed_dim)
-        x = self.embed(x)  # (B, T, emb_dim)
-        return x
-
-
-if __name__ == "__main__":
-    rngs = nnx.Rngs(42)
-    batch_size = 64
-    H = 64
-    W = 64
-    C = 3
-    D = 10
-    T = 10
-    patch_size = 16
-    embed_dim = 192
-    num_layers = 4
-    num_heads = 16
-
-    o_t = jax.random.normal(rngs.params(), (batch_size, H, W, C))
-    a_t = jax.random.normal(rngs.params(), (batch_size, T, D))
-
-    vit = ViT(C, patch_size, H, embed_dim, num_layers, num_heads, rngs)
-    embedder = Embedder(D, D, D, 4, rngs)
-
-    z_t = vit(o_t)
-    a_t = embedder(a_t)
-
-    print(z_t.shape)  # (64, 192): one embedding per frame
-    print(a_t.shape)  # (64, 10, 10)
+    def forward(self, x):
+        return self.net(x)

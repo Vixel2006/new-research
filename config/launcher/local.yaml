@@ -1,0 +1,26 @@
+# @package _global_
+# Single-box launcher: one RTX 2050 on this machine, no SLURM / no submitit.
+#
+# `n_gpus`/`cpus_per_task` are consumed by the repo's cluster launchers; they
+# are kept here (1 GPU, 4 cores) so the same config stays portable if you ever
+# move this to a node with more CPU. `cache_dir: null` keeps datasets and
+# checkpoints under stable-worldmodel's default $STABLEWM_HOME.
+
+defaults:
+  - override /hydra/launcher: basic
+
+n_gpus: 1
+cpus_per_task: 4
+cache_dir: null # Use stable-worldmodel default cache
+wandb:
+  # Off by default: wandb is installed but this box runs offline-ish and the
+  # logger would add a network dependency to every smoke test. Flip to true
+  # (and `wandb login`) for real runs.
+  enabled: false
+  config:
+    entity: stable-wm
+    project: stable-wm
+    name: ${output_model_name}
+    id: ${subdir}
+    resume: allow
+    log_model: False

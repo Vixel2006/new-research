@@ -1,0 +1,37 @@
+# PushT dataset for goal-conditioned LeWM training.
+#
+# Resolved by `swm.data.load_dataset(name)` -> `_resolve_dataset`. Because the
+# name has no "/", it is treated as a LOCAL path under
+# `$STABLEWM_HOME/datasets/` (default `~/.stable_worldmodel/datasets/`) and is
+# NOT auto-downloaded from HuggingFace. Fetch it first:
+#
+#   huggingface-cli download quentinll/lewm-pusht \
+#       pusht_expert_train.h5.zst --repo-type dataset
+#   zstd -d pusht_expert_train.h5.zst
+#   # then convert the .h5 into a .lance table named `pusht_expert_train.lance`
+#   # (see scripts/benchmark/convert.py in the stable-worldmodel repo)
+#
+# Point `name` at any local .lance / .h5 dataset dir to override.
+dataset:
+  # LeWM consumes `num_preds` targets after `history_size` context frames, so a
+  # window is (history_size + num_preds) timesteps long. Interpolated from the
+  # `wm` block, so history_size/num_preds stay the single source of truth.
+  num_steps: ${eval:'${wm.num_preds} + ${wm.history_size}'}
+
+  # Group 5 env steps per action block. PushT is 2-D, so the action embedder
+  # sees input_dim = frameskip * 2 = 10.
+  frameskip: 5
+
+  name: pusht_expert_train.lance
+
+  # `pixels` is excluded from normalizers: images are normalised by the
+  # ImageNet stats + resize in the training script, not column-wise.
+  keys_to_load:
+    - pixels
+    - action
+    - proprio
+    - state
+  keys_to_cache:
+    - action
+    - proprio
+    - state
