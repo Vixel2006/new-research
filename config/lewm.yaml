@@ -97,8 +97,8 @@ model:
     output_dim: ${embed_dim}
     # Cut from upstream 6/16/2048. The predictor runs autoregressively at plan
     # time, so its depth is paid again per CEM step -- worth keeping small.
-    depth: 4
-    heads: 8
+    depth: 6
+    heads: 16
     mlp_dim: 1024
     dim_head: 64
     dropout: 0.1
